@@ -1,0 +1,31 @@
+# environment.yml -- the conda environment you already have on your laptop.
+#
+# This file is the STARTING POINT of the migration, not something LUMI installs.
+# On LUMI its job is to tell you what your code imports; the only packages that
+# get installed there are the ones the LUMI AI image does not already ship.
+# Read README.md, step 3, before you write the extras list.
+#
+# On your laptop it is an ordinary conda environment:
+#
+#   conda env create -f environment.yml
+#   conda activate first-model
+#   python workflow/scripts/train.py --out /tmp/first-run --epochs 30
+
+name: first-model
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11        # LUMI's image has 3.12.3 -- a pin like this is dropped
+  - numpy              # on LUMI these come from the image, not from here
+  - pandas
+  - matplotlib
+  - seaborn
+  - pip
+  - pip:
+      # torch from pip: conda-forge builds are CPU-only, and Apple silicon
+      # wheels only exist on PyPI. On LUMI you install no torch at all -- the
+      # image already contains the ROCm build that is proven on this hardware.
+      - torch
+      - torchinfo
