@@ -8,6 +8,7 @@
 # while telling you what each answer is for. Every question has a recommended default: press Enter.
 #
 # It writes exactly one file -- env.sh, in this directory -- and creates the directories you name.
+# That env.sh sets the same paths the shipped one does, plus LUMI_DATA.
 # Nothing is installed and nothing is submitted. If you would rather do it by hand, skip this and
 # follow README.md step 0; the two produce the same result.
 #
@@ -66,10 +67,28 @@ say ""
 say "2. Where should the code live?"
 say "   Recommended: your own space on /scratch. NOT \$HOME -- its file quota is 100 000 and"
 say "   cannot be raised, and a code checkout is thousands of files."
-CODE_DEFAULT="/scratch/$PROJECT_ID/$USER/code/first-lumi-model"
+# The default is where this script and the checkout actually are, not where they ought to be.
+# EXAMPLE_DIR is what every job reads, and a default pointing at an empty directory is how a
+# reader ends up with a job that cannot find its own scripts.
+CODE_DEFAULT="$HERE"
 # Each answer can also be given as an environment variable, which makes this scriptable and is how
-# it is tested: CODE_DIR=/somewhere ./setup.sh
+# it is tested: a test copies the checkout to a temporary directory and sets CODE_DIR there.
 CODE_DIR="$(ask "Code directory" "${CODE_DIR:-$CODE_DEFAULT}")"
+
+# env.sh records where the code IS. If the answer is somewhere else, this folder has to move there
+# first: an EXAMPLE_DIR naming an empty directory is a job that cannot find its own scripts, and
+# that failure surfaces much later as a confusing missing-file error. So stop before writing.
+if [ "$CODE_DIR" != "$HERE" ]; then
+  say ""
+  say "  This folder is at:  $HERE"
+  say "  You answered:       $CODE_DIR"
+  say ""
+  say "  Move the checkout there first, then run this again:"
+  say "    cd \"$(dirname "$HERE")\""
+  say "    mv \"$(basename "$HERE")\" \"$CODE_DIR\""
+  say "    cd \"$CODE_DIR\" && ./setup.sh"
+  exit 1
+fi
 
 say ""
 say "3. Where should runs write?"
@@ -100,7 +119,7 @@ cat > "$ENV" <<EOF
 
 export PROJECT_ID=$PROJECT_ID
 
-export EXAMPLE_DIR=$CODE_DIR
+export EXAMPLE_DIR=$HERE
 export LUMI_RUNS=$RUNS_DIR
 export LUMI_SOFTWARE=$SOFTWARE_DIR
 export LUMI_DATA=$DATA_DIR
