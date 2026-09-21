@@ -48,7 +48,14 @@ sha256sum -c "$MODEL_LAYER.sha256" >/dev/null
 
 # Provenance: train.py copies these into manifest.json.
 export BASE_IMAGE="$SIF"
-export BASE_IMAGE_SHA256="$(cut -d' ' -f1 "$LUMI_SOFTWARE/laifs/base.path.sha256")"
+# Step 2 of README.md makes the image checksum optional: with none recorded there
+# is nothing to compare, and the manifest says so rather than staying empty. The
+# layer's own checksum is always written by build-layer.sh, so it is always checked.
+if [ -s "$LUMI_SOFTWARE/laifs/base.path.sha256" ]; then
+  export BASE_IMAGE_SHA256="$(cut -d' ' -f1 "$LUMI_SOFTWARE/laifs/base.path.sha256")"
+else
+  export BASE_IMAGE_SHA256="unverified"
+fi
 export MODEL_LAYER_SHA256="$(head -1 "$MODEL_LAYER.sha256" | cut -d' ' -f1)"
 mkdir -p "$RUN"
 

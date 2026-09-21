@@ -9,14 +9,14 @@
 # These are the same three names the author's `lumi-env` environment repository uses, so if you
 # adopt that later nothing here changes meaning.
 
-export PROJECT_ID=project_XXXXXXX                      # <-- EDIT THIS
+export PROJECT_ID=project_XXXXXXX # <-- EDIT THIS
 
-export SCRATCH="/scratch/$PROJECT_ID"                  # the big, fast filesystem
-export USER_SCRATCH="$SCRATCH/$USER"                   # your own space inside it
+export SCRATCH="/scratch/$PROJECT_ID" # the big, fast filesystem
+export USER_SCRATCH="$SCRATCH/$USER"  # your own space inside it
 
-export LUMI_CODE="$USER_SCRATCH/code"                  # code checkouts
-export LUMI_SOFTWARE="$USER_SCRATCH/software"          # images and layers
-export LUMI_RUNS="$USER_SCRATCH/runs"                  # one directory per run
+export LUMI_CODE="$USER_SCRATCH/code"         # code checkouts
+export LUMI_SOFTWARE="$USER_SCRATCH/software" # images and layers
+export LUMI_RUNS="$USER_SCRATCH/runs"         # one directory per run
 
 # Where this example lives. BASH_SOURCE is this file's own path, so this is
 # right no matter which directory you source it from. (This file is bash, not

@@ -103,11 +103,12 @@ Prompts that work well in this folder, for the human's benefit:
 ## Facts you should not have to re-derive
 
 - **The image**: `/appl/local/laifs/containers/lumi-multitorch-latest.sif` is a symlink into a
-  versioned release directory. The pinned copy is written to `$LUMI_SOFTWARE/laifs/base.path` with a
-  sha256 beside it. The `full` tower ships python 3.12.3, torch 2.10.0+rocm7.0, numpy 2.3.5,
-  pandas 2.3.3, matplotlib 3.11.1, scikit-learn 1.9.0, tensorboard 2.21.0, h5py 3.16.0 — read from
-  the image's own published package list on 2026-09-17. To check a package yourself:
-  `singularity run "$SIF" pip list | grep -i <name>`.
+  versioned release directory. The pinned copy is written to `$LUMI_SOFTWARE/laifs/base.path`, and
+  the sha256 beside it is optional — without one `build-layer.sh` skips its check and a run's
+  `manifest.json` records `base_image_sha256: "unverified"`. The `full` tower ships python 3.12.3,
+  torch 2.10.0+rocm7.0, numpy 2.3.5, pandas 2.3.3, matplotlib 3.11.1, scikit-learn 1.9.0,
+  tensorboard 2.21.0, h5py 3.16.0 — read from the image's own published package list on 2026-09-17.
+  To check a package yourself: `singularity run "$SIF" pip list | grep -i <name>`.
 - **The billing**: on `small-g`, GPU-hours = `max(ceil(cores/8), ceil(mem_GB/64), GCDs) × hours × 0.5`.
   `standard-g` bills a whole node (4 GPU-hours per node-hour) whether you use it or not.
   ([billing](https://docs.lumi-supercomputer.eu/runjobs/lumi_env/billing/))

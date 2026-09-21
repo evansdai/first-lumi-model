@@ -18,6 +18,11 @@ channels:
 
 dependencies:
   - python=3.11        # LUMI's image has 3.12.3 -- a pin like this is dropped
+  # One OpenMP runtime only. pip's torch wheel below ships its own libomp.dylib,
+  # and conda-forge's default numpy is OpenBLAS built on llvm-openmp: two copies
+  # in one process abort with "OMP: Error #15 ... already initialized". This
+  # build of OpenBLAS uses pthreads and no OpenMP at all.
+  - libopenblas=*=*pthreads*
   - numpy              # on LUMI these come from the image, not from here
   - pandas
   - matplotlib

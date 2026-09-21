@@ -23,11 +23,6 @@ The script does not change between the machines; only the runtime around it is L
 Step 1 is the laptop run, steps 2, 3 and 6 happen on a login node, and steps 4 and 5 execute on a
 compute node.
 
-> **Status: this exact tutorial has not yet been run end to end.** The pinned image, the
-> interactive GPU route and the equivalent layer workflow have each been tested separately; this
-> folder's own `build-layer.sh` has not. See
-> [Status](#status-what-has-been-run-on-lumi-and-what-has-not) for the recorded runs.
-
 ## What you need
 
 - Your LUMI username and project id (`project_465003379`-style). `lumi-workspaces` on a login node
@@ -150,6 +145,8 @@ $EDITOR env.sh          # the only edit: PROJECT_ID, e.g. project_465003379
 echo "$PROJECT_ID" "/scratch/$PROJECT_ID/$USER"
 test -d "/scratch/$PROJECT_ID/$USER" && echo "scratch path OK"
 
+# the layer and runs go to
+echo "$LUMI_SOFTWARE" "$LUMI_RUNS"
 mkdir -p "$LUMI_SOFTWARE" "$LUMI_RUNS"
 ```
 
@@ -199,10 +196,18 @@ LAIF=/appl/local/laifs/containers/lumi-multitorch-latest.sif
 mkdir -p "$LUMI_SOFTWARE/laifs"
 readlink -f "$LAIF" > "$LUMI_SOFTWARE/laifs/base.path"
 cat "$LUMI_SOFTWARE/laifs/base.path"
+```
+
+```bash
+# Optional, and recommended: record the image's sha256 beside its path, so that you
+# can prove later that a job ran the image you think it did. It reads the whole
+# 14 GB image, so it is the slowest command in this step. Skip it and nothing
+# else breaks: step 3 skips its image check, and each run's manifest.json records
+# base_image_sha256: unverified instead of a hash.
 sha256sum "$(cat "$LUMI_SOFTWARE/laifs/base.path")" \
   > "$LUMI_SOFTWARE/laifs/base.path.sha256"
 
-# And prove the pin verifies. A recorded hash nobody checks is not a pin.
+# And prove the pin verifies: a recorded hash nobody checks is not a pin.
 sha256sum -c "$LUMI_SOFTWARE/laifs/base.path.sha256"      # must print OK
 ```
 
@@ -258,9 +263,9 @@ echo "$MODEL_LAYER"                # every job from now on needs this value
 ```
 
 The script runs that `venv` *inside* the image, installs your extras, checks them by importing,
-verifies the pinned image's checksum, packs the directory into one SquashFS file (`.sqsh`), then
-validates the packed file at the path jobs will mount it. When LAIF publishes a new base, rebuild the
-layer.
+verifies the pinned image's checksum (when step 2 recorded one), packs the directory into one
+SquashFS file (`.sqsh`), then validates the packed file at the path jobs will mount it. When LAIF
+publishes a new base, rebuild the layer.
 
 Then add the `export MODEL_LAYER=...` line to `env.sh`, so new shells have it too.
 
@@ -312,6 +317,12 @@ so `$EXAMPLE_DIR` and `$MODEL_LAYER` are already set. Now, *inside that shell*:
 ```bash
 SIF="$(cat "$LUMI_SOFTWARE/laifs/base.path")"
 
+# Check this before the binds below: if EXAMPLE_DIR is empty, the bind arrives as
+# ":/workspace:ro", and Singularity reads `ro` as the destination -- the FATAL
+# listed under "When something goes wrong" below.
+echo "[$EXAMPLE_DIR]"
+test -n "$EXAMPLE_DIR" || echo "EMPTY: source env.sh on the login node, rerun srun"
+
 # (a) The gate: is there really a usable GPU in this allocation?
 singularity exec --no-home --pwd /workspace \
   -B "$EXAMPLE_DIR:/workspace:ro" \
@@ -335,6 +346,13 @@ Two lines to look for in (a): `hip` non-null and `OK - cuda is usable`. **`hip N
 inside a CPU build of PyTorch**, and any timing from there measures the CPU, not the GPU. In (b), the
 seaborn/torchinfo summary appearing at all proves the layer is mounted and importable — that is the
 migration working.
+
+And why `cuda` and not `rocm`, on an **AMD** GPU: a ROCm build of PyTorch deliberately reuses the
+CUDA interface, and its own note lists `rocm` and `hip` as *invalid* device strings — `cuda` is the
+name for a GCD ([HIP semantics](https://docs.pytorch.org/docs/stable/notes/hip.html)). **HIP** is
+AMD's CUDA-equivalent runtime and kernel language, the thing ROCm builds from
+([What is HIP?](https://rocm.docs.amd.com/projects/HIP/en/latest/what_is_hip.html)); the `hip` line
+above is the version of it this torch was built against, so a CUDA or CPU build prints `None`.
 
 Why the `-B` flags: LUMI does **not** mount `/scratch` or `/project` into a container, and
 `/scratch/<project>` is a symlink, so you bind the *full* path
@@ -382,8 +400,8 @@ Three things must be true, and they are the same three you checked in step 4: th
 `device cuda` with a non-null `hip`, the loss falls, and the final line says `OK 30 epochs ...`.
 
 `manifest.json` is the record of what produced the run: the device, the ROCm build, the resolved
-image and its sha256, the layer and its sha256, the host and the job id. It does not record the
-source revision. For runs comparable by source as well as by runtime, add
+image and — if step 2 recorded one — its sha256, the layer and its sha256, the host and the job id.
+It does not record the source revision. For runs comparable by source as well as by runtime, add
 `git -C "$EXAMPLE_DIR" rev-parse HEAD` and whether the worktree was clean. Provenance is not
 reproducibility, though: that also needs the same seed, arguments and inputs.
 
@@ -425,6 +443,7 @@ Each of these has a cause you can check. None of them means LUMI is broken.
 
 | What you see | What it means | What to do |
 |---|---|---|
+| `FATAL: container creation failed: unable to add /workspace to mount list: destination must be an absolute path` | `$EXAMPLE_DIR` was **empty** in that shell — not a directory problem: `-B ":/workspace:ro"` is read as source `/workspace`, destination `ro` | on the compute node, `echo "[$EXAMPLE_DIR]"` — `[]` means the shell never sourced `env.sh`. Source it on the login node and rerun `srun --pty` |
 | `ModuleNotFoundError: seaborn` | the layer is not mounted, or `python` is the image's own | add `-B "$MODEL_LAYER:/user-software:image-src=/"` and call `/user-software/bin/python` |
 | `No such file` for a path you can `ls` on the login node | `/scratch` is not mounted in containers by default | bind the full path: `$LUMI_RUNS`, never `/scratch` |
 | `hip None`, or training far slower than expected | CPU build, or no GPU in the allocation | check `--gpus-per-task=1`; run `check_platform.py cuda` |
@@ -436,6 +455,7 @@ Each of these has a cause you can check. None of them means LUMI is broken.
 | quota warnings, `lumi-quota -v` file count exploding | packages were installed onto Lustre | that is exactly what the layer prevents; rebuild it instead |
 | the job starts, then dies with `No module named torchinfo` | a package was added to the *image*'s Python instead of the layer | add it to `extra-requirements.txt` and rebuild with a new `LAYER_ID` |
 | `error: this is running inside a container, which has no singularity` | you are in a container, and **containers do not nest on LUMI** — a `singularity` inside one cannot start another | find out for certain with `echo "$SINGULARITY_CONTAINER"`: a path means you are in one. Type `exit` to leave it and rerun the command in a plain login shell. On a login node you are normally *not* in one, so meeting this usually means something put you in a container deliberately |
+| `OMP: Error #15 ... libomp.dylib already initialized`, **on your laptop, in step 1** | your process holds two OpenMP runtimes: conda-forge's default `numpy` comes with the OpenMP build of OpenBLAS, and pip's `torch` wheel ships its own `libomp.dylib` | re-solve step 1's environment: `conda env update -f environment.yml`, which pins `libopenblas=*=*pthreads*` — the build of OpenBLAS that links no OpenMP, so your process loads the runtime once. (`llvm-openmp` can still be *installed*; what matters is which runtime a process loads.) |
 
 ## Where to go next
 
