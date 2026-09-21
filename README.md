@@ -2,8 +2,8 @@
 
 This folder is a complete, small example of the thing you actually want to do: **take an
 environment you already have, put it on LUMI in the form LUMI wants it, debug it interactively on a
-GPU, then train.** This folder is aimed for readers in ralab. Please consider contribute by giving
-feedbacks after you tried.
+GPU, then train.** It is aimed at readers in ralab. Please consider contributing by giving feedback
+after you try it.
 
 Six steps, about 45 minutes of **hands-on** time — plus however long your jobs queue, which is not
 predictable. Well under 1 GPU-hour of the project's allocation.
