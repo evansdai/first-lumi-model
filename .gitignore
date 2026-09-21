@@ -1,0 +1,24 @@
+# Nothing in this folder is generated: it is all source, and all of it belongs in git.
+# This file exists to keep the things that are NOT source out.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
+
+# Runs, layers and images never belong in the checkout -- the tutorial sends them to /scratch.
+# (A 65 MB core dump from a crashed editor plugin landed here once; `core` is why.)
+core
+core.*
+*.sqsh
+*.sif
+*.partial
+
+# setup.sh keeps a copy of env.sh before overwriting it.
+env.sh.before-setup

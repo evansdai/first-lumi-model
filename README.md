@@ -1,11 +1,13 @@
 # Your first model on LUMI — from a conda environment to a GPU job
 
-You know Python and conda on your laptop. You have a LUMI account and you have never used an HPC
-cluster. This folder is a complete, small example of the thing you actually want to do: **take an
+This folder is a complete, small example of the thing you actually want to do: **take an
 environment you already have, put it on LUMI in the form LUMI wants it, debug it interactively on a
-GPU, then train.**
+GPU, then train.** This folder is aimed for readers in ralab. Please consider contribute by giving
+feedbacks after you tried.
 
-Six steps, about 45 minutes of your time, well under 1 GPU-hour of the project's allocation.
+Six steps, about 45 minutes of **hands-on** time — plus however long your jobs queue, which is not
+predictable. Well under 1 GPU-hour of the project's allocation.
+
 
 ```text
 your laptop                       LUMI login node                    LUMI-G compute node
@@ -28,15 +30,19 @@ Five facts explain every LUMI instruction you will meet.
    (Slurm). You never `ssh` to a compute node.
 2. **The GPU is billed per GCD, per minute.** A GCD is half of one MI250x card; a LUMI-G node has
    eight. On the `small-g` partition the bill is
-   `max(ceil(cores/8), ceil(memory_GB/64), GCDs) × hours × 0.5` GPU-hours — the ceilings matter, so
-   *1 GCD, 8 cores, 32 GB* is the cheapest shape that can use a GPU, and doubling the cores doubles
-   the bill for the same work.
+
+   `max(ceil(cores/8), ceil(memory_GB/64), GCDs) × hours × 0.5` GPU-hours
+
+   — **so one GCD for one hour is 0.5 GPU-hours**, and *1 GCD, 8 cores, 32 GB* is the cheapest
+   shape that can use a GPU. The ceilings are what bite: asking for 16 cores instead of 8 doubles
+   the bill for the same work, because you are billed in slices of 8 cores and 64 GB per GCD.
+   ([billing](https://docs.lumi-supercomputer.eu/runjobs/lumi_env/billing/), checked 2026-09-21)
 3. **Never install a Python environment onto the shared filesystem.** An environment is tens of
    thousands of small files; LUMI's filesystems are built for large ones, and LUMI's own docs say a
    file-quota increase caused by Conda is refused. The environment arrives as **one file**.
-4. **You do not build the GPU stack.** LUMI publishes ready-made AI containers with ROCm and
-   PyTorch already in them. Your job is to *add your packages* to one of those, not to build a
-   PyTorch.
+4. **You do not build the GPU stack.** LUMI publishes ready-made AI containers with PyTorch and ROCm
+   (AMD's GPU software stack — the equivalent of NVIDIA's CUDA, which you may have met instead)
+   already in them. Your job is to *add your packages* to one of those, not to build a PyTorch.
 5. **Debug interactively first, then submit a batch job.** `srun --pty` gives you a shell on a
    compute node with a GPU for half an hour. Only when the thing works there do you `sbatch` it.
 
@@ -86,9 +92,28 @@ where you find your own bugs.
   [First steps](https://docs.lumi-supercomputer.eu/firststeps/accessLUMI/).
 - Somewhere to put these files: `/scratch/<project>/<user>/code/`, created below.
 
+**If you work in VS Code rather than a terminal**, three things make this page easier:
+
+1. **Edit files in the editor, not with `$EDITOR`.** Where a step says `$EDITOR env.sh`, open
+   `env.sh` in VS Code and change the line. If `$EDITOR` is unset, a terminal command will not work
+   at all — use `${EDITOR:-nano} env.sh` as the fallback.
+2. **Paste commands into the integrated terminal, and check which machine it is on.** The editor
+   window does not decide that: a Remote-SSH window and a web-UI Desktop terminal are different
+   contexts. The "Where each command runs" note below is the thing to check.
+3. **If you use an AI assistant, tell it to read the local files first** — this folder's
+   `AGENTS.md` and `README.md`. Do not assume it reads them on its own; say so explicitly. That file
+   lists the specific wrong turns an assistant tends to take here.
+
+## Where each command runs
+
+Two machines are involved and it matters which one you are typing on. 
+
+- **On your laptop** — where you already have conda, and where this folder is a normal directory.
+- **On a LUMI login node** — the prompt looks like `you@uanNN:~>` after `ssh <user>@lumi.csc.fi`.
+
 ## Step 0 — put these files on LUMI (~5 minutes)
 
-From your laptop, upload the folder. Either `scp`:
+**On your laptop**, upload the folder. Either `scp`:
 
 ```bash
 scp -r first-lumi-model <user>@lumi.csc.fi:/scratch/<project>/<user>/
@@ -96,10 +121,12 @@ scp -r first-lumi-model <user>@lumi.csc.fi:/scratch/<project>/<user>/
 
 or use the web interface (Files → navigate to `/scratch/<project>/<user>` → Upload).
 
-*(If this repository is already deployed on your LUMI account as `~/lumi`, the same folder is at
-`~/lumi/examples/first-lumi-model` — copy it to `/scratch` rather than editing it in place.)*
+**Or skip the hand-editing: run `./setup.sh`.** It asks three questions — your project id, where
+the code goes, where runs go — with a recommended default for each, writes `env.sh` for you, and
+creates the directories. It tells you why each answer matters as it goes, and prints where to read
+more. Everything below is what it does by hand, if you would rather see it.
 
-Then, on the login node, make the directories and set your project id:
+**On a LUMI login node**, make the directories and set your project id:
 
 ```bash
 mkdir -p /scratch/<project>/<user>/code
@@ -108,6 +135,11 @@ cd /scratch/<project>/<user>/code/first-lumi-model
 $EDITOR env.sh          # the only edit: PROJECT_ID, e.g. project_465003379
 . ./env.sh              # so every command below sees $EXAMPLE_DIR, $LUMI_RUNS, ...
 
+# Cross-check before going further: both must print something real, and the second must be a
+# directory. A typo here surfaces much later as a confusing permission error.
+echo "$PROJECT_ID" "$USER_SCRATCH"
+test -d "/scratch/$PROJECT_ID/$USER" && echo "scratch path OK"
+
 mkdir -p "$LUMI_CODE" "$LUMI_SOFTWARE" "$LUMI_RUNS"
 ```
 
@@ -115,11 +147,15 @@ mkdir -p "$LUMI_CODE" "$LUMI_SOFTWARE" "$LUMI_RUNS"
 Add it to `~/.bashrc` once, so new shells know it (replace the path with your own):
 
 ```bash
-printf '. /scratch/<project>/%s/code/first-lumi-model/env.sh\n' "$USER" >> ~/.bashrc
+# In VS Code: open ~/.bashrc and add this line, replacing <project> with your own.
+# From a terminal, the idempotent version -- running it twice does not add the line twice:
+grep -q 'first-lumi-model/env.sh' ~/.bashrc || \
+  printf '. /scratch/<project>/%s/code/first-lumi-model/env.sh\n' "$USER" >> ~/.bashrc
 ```
 
 ## Step 1 — run the model on your laptop first (seconds)
 
+**On your laptop** — in the **original** folder you uploaded from, *not* in the LUMI terminal.
 The fastest place to find a bug in your own code is your laptop. This example's model is small on
 purpose, but the shape is the same as any training script: data, model, loop, metrics.
 
@@ -147,6 +183,9 @@ readlink -f "$LAIF" > "$LUMI_SOFTWARE/laifs/base.path"
 cat "$LUMI_SOFTWARE/laifs/base.path"
 sha256sum "$(cat "$LUMI_SOFTWARE/laifs/base.path")" \
   > "$LUMI_SOFTWARE/laifs/base.path.sha256"
+
+# And prove the pin verifies. A recorded hash nobody checks is not a pin.
+sha256sum -c "$LUMI_SOFTWARE/laifs/base.path.sha256"      # must print OK
 ```
 
 That file is now *the* definition of your runtime, and every job reads it:
@@ -178,8 +217,15 @@ LUMI's AI image (14 GB, read-only, shared)     your layer (one small file)
 At run time one container mounts both: the image as `/`, your layer at `/user-software`.
 
 You write down the difference in `workflow/envs/extra-requirements.txt` — for this example that is
-`seaborn` and `torchinfo`, and nothing else. Then one command builds it, and it refuses to leave a
-half-built file behind:
+`seaborn` and `torchinfo`, and nothing else.
+
+The mechanism that makes this cheap is `python -m venv --system-site-packages`: it creates a normal
+virtual environment, but one that can still **see the packages already installed in the image**. So
+the layer holds only your additions, and the image's torch — the one built for this hardware — is
+what your code imports. That is also why the layer is tied to one image, and why the image's version
+is recorded beside it.
+
+Then one command builds it, and it refuses to leave a half-built file behind:
 
 ```bash
 LAYER_ID="first-model-$(date -u +%Y%m%d)"
@@ -196,6 +242,16 @@ this cheap and what ties the layer to this exact image: when LAIF publishes a ne
 layer.
 
 Then add the `export MODEL_LAYER=...` line to `env.sh`, so new shells have it too.
+
+**What success looks like.** The script ends with `published <path>`, then prints the
+`export MODEL_LAYER=...` line to copy. Four files must exist — the layer and three records beside it
+— and a leftover `.partial` means the publication was interrupted, so treat that version as
+unpublished:
+
+```bash
+ls -lh "$MODEL_LAYER"*
+# .sqsh  .sqsh.freeze.txt  .sqsh.manifest.txt  .sqsh.sha256
+```
 
 <details>
 <summary>What the layer is, and why not simply <code>conda create</code> on <code>/scratch</code></summary>
@@ -331,6 +387,7 @@ Every one of these has an obvious cause; none of them means LUMI is broken.
 | job killed on a login node (`Killed`, exit 137) | heavy work on a login node: a 24 CPU-core-hour cap is enforced by killing | move it into `srun --pty` |
 | quota warnings, `lumi-quota -v` file count exploding | packages were installed onto Lustre | that is exactly what the layer prevents; rebuild it instead |
 | the job starts, then dies with `No module named torchinfo` | a package was added to the *image*'s Python instead of the layer | add it to `extra-requirements.txt` and rebuild with a new `LAYER_ID` |
+| `error: this is running inside a container, which has no singularity` | you are in a container, and **containers do not nest on LUMI** — a `singularity` inside one cannot start another | find out for certain with `echo "$SINGULARITY_CONTAINER"`: a path means you are in one. Type `exit` to leave it and rerun the command in a plain login shell. On a login node you are normally *not* in one, so meeting this usually means something put you in a container deliberately |
 
 ## What it cost
 
@@ -349,44 +406,27 @@ that finish is also what grows the project's allocation, so this is not the plac
 
 ## Where to go next
 
-**A bigger environment.** Two documented routes, in increasing cost:
+Five short pointers. Each goes deeper only if you need it — nothing here is required for the
+tutorial's six steps.
 
-- **Extend the AI image into your own container.** A five-line `.def` (`Bootstrap: docker`,
-  `From: docker.io/lumiaifactory/lumi-multitorch:torch`, `%post pip install ...`) built on LUMI with
-  `module load CrayEnv PRoot; singularity build yours.sif yours.def`; the
-  [AI environment page](https://docs.lumi-supercomputer.eu/laif/software/ai-environment/) has both
-  examples and warns that the build needs memory — use an interactive job.
-- **`cotainr`, from a conda environment file.** `module load CrayEnv; module load cotainr;
-  cotainr build my.sif --system=lumi-g --conda-env=environment.yml`. Read
-  [cotainr's LUMI ROCm example](https://github.com/DeiC-HPC/cotainr/tree/main/examples/LUMI/conda_pytorch_rocm)
-  before writing a `torch` line: the `pytorch` conda channel has no ROCm builds, and a container
-  built from it ends up CPU-only.
+| If you want to… | Read |
+|---|---|
+| **know where this route stops** — and what to do instead when it does | [`docs/other-ways-to-build-an-environment.md`](docs/other-ways-to-build-an-environment.md) — the same decision as a table: four ways to prepare an environment, and the one question that picks between them |
+| **use more than one GCD** | [`docs/more-gpus.md`](docs/more-gpus.md) — one GCD is one process, and `--ntasks-per-node` plus `torchrun` is 64 processes for 8 GCDs |
+| **watch a run, or use a notebook** | [`docs/observing-a-run.md`](docs/observing-a-run.md) — TensorBoard and Jupyter through LUMI's web interface |
+| **let a coding agent do the boring parts** | [`docs/working-with-an-agent.md`](docs/working-with-an-agent.md) — what to tell it, and the five specific mistakes it will make here |
+| **run several environments in one workflow** | the environment manual's §9, "The general pattern: adding a training task" — the long form of step 3, with sources. It lives in the author's `lumi-env` repository alongside this folder; ask for access if you want it |
 
-**More GPUs.** One GCD is one process. Eight GCDs on a node means `--gpus-per-node=8` and either
-`--ntasks-per-node=8` (one rank per GCD) or `torchrun --nproc-per-node=8` — never both. The
-[LUMI AI Guide](https://github.com/Lumi-supercomputer/LUMI-AI-Guide) works both shapes out; start
-there rather than inventing one.
-
-**Curves while it trains.** The image already ships `tensorboard`. Write one event directory per run
-from rank 0, then open the web interface at [www.lumi.csc.fi](https://www.lumi.csc.fi) → TensorBoard
-([web UI apps](https://docs.lumi-supercomputer.eu/runjobs/webui/)).
-
-**Jupyter on a compute node**, if you prefer notebooks to scripts: the same web interface, with
-`lumi-multitorch` as the Python.
-
-**Let an agent drive the boring parts.** [`AGENTS.md`](AGENTS.md) in this folder tells any terminal
-coding agent what it may and may not do here. Read LUMI's own
-[AI agent guide](https://docs.lumi-supercomputer.eu/development/ai-tools/ai-agent-guide/) too: you
-are responsible for everything your agent does, and it should run in a container for that reason.
-
-**The long form of step 3**, with sources and the alternatives, is this repository's
-[`docs/50-workflow-envs-multiproject.md`](../../docs/50-workflow-envs-multiproject.md). It also covers
-the case this example deliberately skips: several environments in one workflow.
+**The short version of the boundary, in case you read nothing else:** this route is the cheap
+default for one class of task — packages you *add* to the AI image. When your extras would
+*replace* something the image already defines, you want your own container instead, and
+[`docs/other-ways-to-build-an-environment.md`](docs/other-ways-to-build-an-environment.md) is where that
+starts.
 
 ## Status: what has been run on LUMI and what has not
 
 This example is written against LUMI's documentation and against this repository's own run log
-([`../../docs/EVIDENCE.md`](../../docs/EVIDENCE.md)). Being precise about that is a house rule here,
+(the environment manual's `EVIDENCE.md`, in the author's `lumi-env` repository). Being precise about that is a house rule here,
 and it is also how you should read anyone else's example.
 
 | Claim | Status |
@@ -395,7 +435,8 @@ and it is also how you should read anyone else's example.
 | A pinned `lumi-multitorch-full` image training a model on one GCD (`hip 7.0.51831`) | **verified** — job `22098853`, 2026-09-16 (a sibling toy model in this repository) |
 | `srun --pty bash` giving a shell on a compute node, and jobs submitted from it | **verified** — jobs `22099993`, `22116162`, `22100268`, 2026-09-16/17 |
 | `mksquashfs` available on a login node | **verified** — 2026-09-13 |
-| **The layer build in `build-layer.sh`** (venv inside the image → `.sqsh` → validate at `/user-software`), **and the `-B <layer>:/user-software:image-src=/` bind that jobs use** | **not yet run on LUMI.** It is step 3, and the first thing to do if something here fails |
+| **The layer route itself** — venv inside the image at `/user-software` → one `.sqsh` → validate at the final path → mount it in a job → train on one GCD | **verified**, on a real workflow, 2026-09-17/18: the layer was built, accepted under real Singularity and on a GCD, and the model trained (`hip 7.0.51831`, job `22149955`). The full log is `EVIDENCE.md` in the environment manual |
+| **`build-layer.sh` in this folder** — this tutorial's own copy of that build | **not yet run on LUMI.** It is step 3, and the first thing to do if something here fails. Its dependency gate was corrected on 2026-09-18 to match what the real image needs |
 | This example end to end, as written | **not yet run.** Treat the first pass as the test |
 
 If a step fails in a way this page does not explain, that is a defect in the page: write down the

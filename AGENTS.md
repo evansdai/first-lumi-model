@@ -23,7 +23,7 @@ it honest.
 | `workflow/envs/extra-requirements.txt` | what LUMI must add to the image. Read its header before changing it. |
 | `workflow/scripts/train.py`, `src/minimodel/` | portable Python. No LUMI path belongs in either. |
 | `workflow/profiles/lumi-g/train.sbatch` | the only other LUMI-shaped file: resources, binds, paths. |
-| `tools/check_platform.py` | a verbatim copy of `~/lumi/templates/tools/check_platform.py`. Refresh it from there; do not edit the copy. |
+| `tools/check_platform.py` | a **verbatim copy** of the maintained probe from the author's `lumi-env` repository (`templates/tools/check_platform.py`). Refresh it from there; do not edit the copy, and do not write a second one. If you cannot reach that repository, treat this copy as the authority and say so when you change it |
 
 The design is one sentence: **the AI image is fixed, your layer is the only thing you build, and the
 model and training code stay portable.** Anything you add that blurs this is a regression, not a
@@ -64,7 +64,7 @@ python3 -m py_compile workflow/scripts/train.py src/minimodel/*.py
 ```
 
 Then, for claims about LUMI: name the source. Either a documentation URL, or an entry in this
-repository's run log (`../../docs/EVIDENCE.md`), or the words **"unverified — and here is the command
+repository's run log (`EVIDENCE.md`, in the environment manual), or the words **"unverified — and here is the command
 that would settle it"**. Never a third option. A confident sentence with no source is the specific
 defect this repository exists to correct, and it has been caught twice by review here already.
 

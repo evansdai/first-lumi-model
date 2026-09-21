@@ -6,8 +6,8 @@
 # your allocation is billed to. `lumi-workspaces` lists the projects you belong
 # to; the id looks like project_465003379.
 #
-# These are the same three names the `~/lumi` environment repository uses, so if
-# you adopt that later nothing here changes meaning.
+# These are the same three names the author's `lumi-env` environment repository uses, so if you
+# adopt that later nothing here changes meaning.
 
 export PROJECT_ID=project_XXXXXXX                      # <-- EDIT THIS
 

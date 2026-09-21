@@ -114,7 +114,7 @@ singularity exec \
     python -m venv /user-software --system-site-packages
     /user-software/bin/python -m pip install --no-cache-dir \
       --requirement /workspace/workflow/envs/extra-requirements.txt
-    /user-software/bin/python -m pip check
+    # No `pip check` here, deliberately -- see the dependency gate below the pack.
     /user-software/bin/python -m pip freeze --all > /run/freeze.txt
     echo
     echo "installed into the layer:"
@@ -139,13 +139,33 @@ mksquashfs "$VENV" "$SQSH.partial" \
 # the container, which is where your job runs.
 echo
 echo "== validating the packed layer at /user-software =="
-# pip check first: the same dependency contract the venv passed above, but now
-# read from the artifact that jobs will mount.
-singularity exec \
-  --no-home \
+# The dependency gate. NOT a bare `pip check`, and that is not a style choice.
+#
+# The AI image is inconsistent by `pip check`'s standard ON ITS OWN: it ships vllm 0.22.1, which
+# requires compressed-tensors==0.15.0.1, and ships compressed-tensors 0.17.1 (read from the image's
+# own published package list). A bare `pip check` therefore fails before your extras are involved,
+# and `set -e` would stop the build here -- a working layer would look like a broken one.
+#
+# The question that matters is whether YOUR packages introduced a conflict, so ask it
+# differentially: the image alone, then the image with your layer, and compare.
+BASE_CHECK="$RUN/check-base.txt"
+LAYER_CHECK="$RUN/check-layer.txt"
+# The image's own python, by path: `python` would depend on the image's PATH, and this runs
+# with --no-home and no profile.
+singularity exec --no-home "$BASE_SIF" /opt/venv/bin/python -m pip check > "$BASE_CHECK" 2>&1 || true
+singularity exec --no-home \
   -B "$SQSH.partial:/user-software:image-src=/" \
-  "$BASE_SIF" \
-  /user-software/bin/python -m pip check
+  "$BASE_SIF" /user-software/bin/python -m pip check > "$LAYER_CHECK" 2>&1 || true
+
+echo "pre-existing conflicts in the image (expected, not your fault):"
+sed 's/^/    /' "$BASE_CHECK"
+if diff -q "$BASE_CHECK" "$LAYER_CHECK" >/dev/null; then
+  echo "  your extras added none"
+else
+  echo "  YOUR EXTRAS CHANGED THIS -- fix them before publishing:"
+  diff "$BASE_CHECK" "$LAYER_CHECK" | sed 's/^/    /'
+  exit 1
+fi
 
 singularity exec \
   --no-home \
