@@ -1,0 +1,41 @@
+# extra-environment.yml -- the packages LUMI must ADD to the AI image.
+#
+# This is the file that makes `environment.yml` into something LUMI can run. It is
+# short on purpose. The AI image already contains (checked 2026-09-17, in the
+# image's own published package list):
+#
+#   python 3.12.3   torch 2.10.0+rocm7.0   numpy 2.3.5   pandas 2.3.3
+#   matplotlib 3.11.1   scikit-learn 1.9.0   tensorboard 2.21.0   h5py 3.16.0
+#
+# so almost nothing from environment.yml is installed here. Only:
+#
+#   seaborn    -- draws the loss curve at the end of training
+#   torchinfo  -- prints the model summary at the start
+#
+# Check any package before you add it:
+#
+#   SIF="$(cat "$LUMI_SOFTWARE/laifs/base.path")"
+#   singularity run "$SIF" pip list | grep -i <package>
+#
+# NEVER list here: torch, torchvision, torchaudio, numpy, scipy, pandas,
+# matplotlib, h5py. They are all in the image, and with `--system-site-packages`
+# pip installs a second copy over the image's -- which for anything compiled
+# against ROCm or the numpy 2 ABI is how a working job breaks. `torch` is also the
+# line that would force the slow build route. layer-build refuses those rather
+# than building a layer that shadows the image; see layer-build/MANUAL.md.
+#
+# Versions are not pinned here. The *layer* is immutable and identifiable: it is
+# hashed, and <layer>.freeze.txt records exactly what this build installed. A
+# later rebuild from this list may resolve newer versions -- the list is not a
+# lock. Pin versions here (or build from a lock file) when a run has to be
+# reproduced exactly.
+#
+# This is an environment.yml, not a requirements.txt: `layer-build` reads conda
+# environment files, so the packages live under the pip: key. Everything the
+# image already has is left alone; only the difference is installed.
+
+name: first-model-extras
+dependencies:
+  - pip:
+      - seaborn
+      - torchinfo

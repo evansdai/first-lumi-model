@@ -32,7 +32,7 @@ say ""
 say "Setting up the first-lumi-model example."
 say ""
 say "Three questions, all with defaults. Press Enter to accept one."
-say "More detail on any of them: README.md step 0, and docs/10 in the environment manual."
+say "More detail on any of them: README.md step 0."
 say ""
 
 if [ ! -t 0 ]; then
@@ -45,9 +45,9 @@ say "1. Your LUMI project."
 say "   This is the allocation your jobs are billed to. It is also part of every path below,"
 say "   so getting it wrong shows up later as a permission error."
 say "   If you do not know it, open another terminal and run:  lumi-workspaces"
-# Deliberately NOT ${PROJECT_ID:-...}. `PROJECT_ID` is a common name and the author's own env.sh sets
-# it, so inheriting it would silently write SOMEONE ELSE'S project into this file -- and every job
-# would then bill them. The scriptable override is a name that cannot collide.
+# Deliberately NOT ${PROJECT_ID:-...}. `PROJECT_ID` is a common name and a parent shell may already
+# export it, so inheriting it would silently write SOMEONE ELSE'S project into this file -- and every
+# job would then bill them. The scriptable override is a name that cannot collide.
 PROJECT_ID="$(ask "Project id" "${SETUP_PROJECT_ID:-project_XXXXXXX}")"
 
 case "$PROJECT_ID" in
@@ -60,9 +60,10 @@ case "$PROJECT_ID" in
 esac
 
 # --- where things go ----------------------------------------------------------
-# The defaults follow docs/10: code, software, runs and data all live under your own space on
-# /scratch, never under $HOME (a 100 000-file quota that cannot be raised) and never under /project
-# (shared, and a 100 000-file quota of its own).
+# The defaults follow the layout README.md's "Files and commands on LUMI you will actually use"
+# describes: code, software, runs and data all live under your own space on /scratch, never under
+# $HOME (a 100 000-file quota that cannot be raised) and never under /project (shared, and a
+# 100 000-file quota of its own).
 say ""
 say "2. Where should the code live?"
 say "   Recommended: your own space on /scratch. NOT \$HOME -- its file quota is 100 000 and"
@@ -111,11 +112,17 @@ say ""
 ENV="$HERE/env.sh"
 cp "$ENV" "$ENV.before-setup" 2>/dev/null || true
 
+# layer-build (step 3, with --export-to) writes an `export MODEL_LAYER=` line into this file. Rewriting the file
+# without it would silently drop the layer every later step mounts, so read it before the rewrite
+# and carry it over after.
+KEEP_LAYER="$(sed -n '/^export MODEL_LAYER=/p' "$ENV" 2>/dev/null | tail -n 1 || true)"
+
 cat > "$ENV" <<EOF
 # env.sh -- written by setup.sh on $(date -u +%FT%TZ)
 #
 # The paths this example uses. Every script here reads this file; nothing else needs editing.
 # The previous contents are in env.sh.before-setup if you want to compare.
+# layer-build (step 3) adds an export MODEL_LAYER= line here; rerunning this script keeps it.
 
 export PROJECT_ID=$PROJECT_ID
 
@@ -125,7 +132,15 @@ export LUMI_SOFTWARE=$SOFTWARE_DIR
 export LUMI_DATA=$DATA_DIR
 EOF
 
+# Carry over the layer line layer-build wrote, if this env.sh had one.
+if [ -n "$KEEP_LAYER" ]; then
+  printf '%s\n' "$KEEP_LAYER" >> "$ENV"
+fi
+
 say "Wrote $ENV"
+if [ -n "$KEEP_LAYER" ]; then
+  say "  kept  $KEEP_LAYER"
+fi
 say ""
 
 # --- make the directories -----------------------------------------------------
@@ -181,5 +196,5 @@ say "  README.md step 3   build the layer that carries your extra packages."
 say ""
 say "  If you want the reasoning behind the layout above -- why /scratch and not \$HOME, why"
 say "  runs get their own directory -- README.md 'Files and commands on LUMI you will"
-say "  actually use', and docs/10 in the environment manual."
+say "  actually use'."
 say ""

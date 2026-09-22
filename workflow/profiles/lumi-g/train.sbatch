@@ -19,8 +19,7 @@
 # promise: you are billed for the time the job actually runs.
 #
 # Submit it with your project id, from the directory the log should land in:
-#   source /path/to/first-lumi-model/env.sh
-#   export MODEL_LAYER="$LUMI_SOFTWARE/venvs/<your-layer>.sqsh"
+#   source /path/to/first-lumi-model/env.sh   # step 3 wrote MODEL_LAYER in there
 #   cd "$LUMI_RUNS"
 #   sbatch --account="$PROJECT_ID" \
 #     "$EXAMPLE_DIR/workflow/profiles/lumi-g/train.sbatch"
@@ -33,7 +32,7 @@ set -euo pipefail
 # Slurm copies the submitting environment into the job, so if you sourced env.sh
 # in your shell, EXAMPLE_DIR and MODEL_LAYER are already set here.
 : "${EXAMPLE_DIR:?source env.sh before submitting}"
-: "${MODEL_LAYER:?export MODEL_LAYER=<the .sqsh from build-layer.sh>}"
+: "${MODEL_LAYER:?export MODEL_LAYER=<the .sqsh from layer-build>}"
 . "$EXAMPLE_DIR/env.sh"
 
 # /scratch/<project> is a symlink, and LUMI does not mount /scratch into a
@@ -50,7 +49,7 @@ sha256sum -c "$MODEL_LAYER.sha256" >/dev/null
 export BASE_IMAGE="$SIF"
 # Step 2 of README.md makes the image checksum optional: with none recorded there
 # is nothing to compare, and the manifest says so rather than staying empty. The
-# layer's own checksum is always written by build-layer.sh, so it is always checked.
+# layer's own checksum is always written by layer-build, so it is always checked.
 if [ -s "$LUMI_SOFTWARE/laifs/base.path.sha256" ]; then
   export BASE_IMAGE_SHA256="$(cut -d' ' -f1 "$LUMI_SOFTWARE/laifs/base.path.sha256")"
 else

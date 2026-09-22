@@ -18,12 +18,12 @@ it honest.
 | Path | It is |
 |---|---|
 | `README.md` | the human's six steps. The specification for what you are helping with. |
-| `env.sh` | the paths. The user edits `PROJECT_ID`; you normally should not. |
-| `build-layer.sh` | step 3: extras list → one `.sqsh` layer, inside the pinned AI image. |
-| `workflow/envs/extra-requirements.txt` | what LUMI must add to the image. Read its header before changing it. |
+| `env.sh` | the paths, plus the `MODEL_LAYER` line the builder writes into it. The user edits `PROJECT_ID`; you normally should not. |
+| `layer-build/` | step 3: the builder — `layer-build` (one Python file, no dependencies), `MANUAL.md` (its contract) and `tests/`. Read `MANUAL.md` before changing it. It is the tool, not a copy of one: it refuses to shadow the image's stack |
+| `workflow/envs/extra-environment.yml` | what LUMI must add to the image. Read its header before changing it. |
 | `workflow/scripts/train.py`, `src/minimodel/` | portable Python. No LUMI path belongs in either. |
 | `workflow/profiles/lumi-g/train.sbatch` | the only other LUMI-shaped file: resources, binds, paths. |
-| `tools/check_platform.py` | a **verbatim copy** of the maintained probe from the author's `lumi-env` repository (`templates/tools/check_platform.py`). Refresh it from there; do not edit the copy, and do not write a second one. If you cannot reach that repository, treat this copy as the authority and say so when you change it |
+| `tools/check_platform.py` | the author's maintained probe, kept as a copy here. Treat this copy as the authority: do not edit it, do not write a second one, and if a newer copy is handed to you, replace this one wholesale rather than merging — then re-apply its one local edit (2026-09-21): the docstrings no longer cite a document you cannot read |
 
 The design is one sentence: **the AI image is fixed, your layer is the only thing you build, and the
 model and training code stay portable.** Anything you add that blurs this is a regression, not a
@@ -59,12 +59,13 @@ feature.
 Say a change is done only after the checks below, with the output shown, not summarized:
 
 ```bash
-bash -n build-layer.sh workflow/profiles/lumi-g/train.sbatch
+python3 layer-build/tests/test-layer-build.py
+bash -n workflow/profiles/lumi-g/train.sbatch setup.sh
 python3 -m py_compile workflow/scripts/train.py src/minimodel/*.py
 ```
 
-Then, for claims about LUMI: name the source. Either a documentation URL, or an entry in this
-repository's run log (`EVIDENCE.md`, in the environment manual), or the words **"unverified — and here is the command
+Then, for claims about LUMI: name the source. Either a documentation URL, or a run recorded with
+its job id and date, or the words **"unverified — and here is the command
 that would settle it"**. Never a third option. A confident sentence with no source is the specific
 defect this repository exists to correct, and it has been caught twice by review here already.
 
@@ -104,7 +105,7 @@ Prompts that work well in this folder, for the human's benefit:
 
 - **The image**: `/appl/local/laifs/containers/lumi-multitorch-latest.sif` is a symlink into a
   versioned release directory. The pinned copy is written to `$LUMI_SOFTWARE/laifs/base.path`, and
-  the sha256 beside it is optional — without one `build-layer.sh` skips its check and a run's
+  the sha256 beside it is optional — without one the builder is not given `--base-sha256` and a run's
   `manifest.json` records `base_image_sha256: "unverified"`. The `full` tower ships python 3.12.3,
   torch 2.10.0+rocm7.0, numpy 2.3.5, pandas 2.3.3, matplotlib 3.11.1, scikit-learn 1.9.0,
   tensorboard 2.21.0, h5py 3.16.0 — read from the image's own published package list on 2026-09-17.

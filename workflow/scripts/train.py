@@ -43,10 +43,10 @@ matplotlib.use("Agg")  # no display on a compute node; write files only
 
 import matplotlib.pyplot as plt  # noqa: E402  (after matplotlib.use)
 import pandas as pd  # noqa: E402
-import seaborn as sns  # noqa: E402  -- installed by build-layer.sh, not in the image
+import seaborn as sns  # noqa: E402  -- installed by layer-build, not in the image
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from torchinfo import summary  # noqa: E402  -- installed by build-layer.sh
+from torchinfo import summary  # noqa: E402  -- installed by layer-build
 
 # Make `src/minimodel` importable however this file is invoked. One line, so a
 # beginner does not have to know about PYTHONPATH or `pip install -e .`.
@@ -90,10 +90,13 @@ def environment(device: torch.device, args: argparse.Namespace) -> dict:
         # Set by the job script and by you; empty when run straight from a shell.
         "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
         "slurm_partition": os.environ.get("SLURM_JOB_PARTITION", ""),
+        # Set by the job script (train.sbatch) and, for MODEL_LAYER, by env.sh. "unverified"
+        # rather than "" when a field is absent: a hand-run's manifest should say what it does not
+        # know, the same way step 2's optional image checksum does.
         "layer": os.environ.get("MODEL_LAYER", ""),
-        "layer_sha256": os.environ.get("MODEL_LAYER_SHA256", ""),
+        "layer_sha256": os.environ.get("MODEL_LAYER_SHA256", "") or "unverified",
         "base_image": os.environ.get("BASE_IMAGE", ""),
-        "base_image_sha256": os.environ.get("BASE_IMAGE_SHA256", ""),
+        "base_image_sha256": os.environ.get("BASE_IMAGE_SHA256", "") or "unverified",
         "argv": sys.argv,
         "args": vars(args),
     }
@@ -160,7 +163,7 @@ def train(args: argparse.Namespace, device: torch.device, out: Path) -> dict:
 def plot(history: list[dict], out_path: Path) -> None:
     """Draw the two curves that answer 'did it learn?'.
 
-    seaborn is one of the two packages build-layer.sh installed, so this
+    seaborn is one of the two packages layer-build installed, so this
     function is also the smoke test for the layer: if the imports at the top of
     this file failed, you would never get here.
     """

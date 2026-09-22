@@ -88,9 +88,25 @@ from it ends up CPU-only.
 > *which question you are answering*. If you need one of them, work from LUMI's own examples rather
 > than from this page.
 
+## Building the layer for your own packages
+
+Step 3 of the tutorial calls [`layer-build/`](../layer-build/MANUAL.md) — one Python file with no
+dependencies, its manual, and its tests. It is the builder for this route, and it refuses the cases
+that do not work rather than building a layer that breaks later:
+
+- it reads a **conda environment file** — `environment.yml`, `conda env export --json`, or
+  `conda list --json` — not a `requirements.txt`;
+- it asks the image what it already has and installs only the difference;
+- it **refuses to shadow the image's stack** — a different `numpy`, a second `torch` — and says which
+  package, which version the image has, and why it matters;
+- it exits `3` on a conflict, so a script or an agent can branch on the result, and `--json` gives the
+  same answer as one object.
+
+The manual is the contract: [`layer-build/MANUAL.md`](../layer-build/MANUAL.md). If your extras would
+*replace* something the image already defines, no flag helps: that is route 2 or 3 above.
+
 ## The long form
 
-This page is the short version. The long one — with sources, the reasoning, and the case this
-tutorial deliberately skips (*several* environments in one workflow) — is the environment manual's
-§9, "The general pattern: adding a training task". It lives in the author's `lumi-env` repository
-alongside this folder; ask for access if you want it.
+This page is the short version, and it is the whole of what is published. The case it deliberately
+skips is *several* environments in one workflow: when two steps need environments that conflict,
+that is the two-image question above — not something one more layer can solve.

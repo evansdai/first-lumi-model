@@ -21,8 +21,8 @@ result back.
 
    | The agent will want to… | Why that breaks |
    |---|---|
-   | put `torch` or `numpy` in `extra-requirements.txt` | they are already in the image, and installing a second copy shadows the ROCm build that works |
-   | run the build from inside a container | containers do not nest on LUMI; the script refuses, and the refusal is correct |
+   | put `torch` or `numpy` in `extra-environment.yml` | they are already in the image, and installing a second copy shadows the ROCm build that works |
+   | run the build from inside a container | containers do not nest on LUMI; the tool refuses, and the refusal is correct |
    | set `SINGULARITYENV_PYTHONPATH` to add a source path | it **replaces** the image's value, which is how the image exposes its whole Python stack — you lose numpy and torch |
    | hand-write a package's `.dist-info` to satisfy an import | it works once and is not a fix; install the distribution instead |
    | write its own `check_platform.py` | this folder already carries the maintained one, and a second copy drifts |

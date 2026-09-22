@@ -8,7 +8,7 @@ Three targets, one script:
 
 The point is not the versions. It is (a) that a real tensor operation works on the
 resolved device, and (b) which dtypes this backend can actually do — because the
-portability contract in lumi-env docs/workflow/20 depends on both.
+portability contract this folder follows depends on both.
 
 Exit code is non-zero if the device is unusable, so this works as a gate in a job script — but
 only for the device it resolves. With no argument that is `cuda` if available, then `mps`, then
@@ -28,7 +28,7 @@ SEP = "-" * 58
 
 
 def resolve_device(prefer: str = "auto") -> torch.device:
-    """lumi-env docs/workflow/20 R1: resolve the device at runtime; never name it in code.
+    """Resolve the device at runtime; never name it in code.
 
     Note that ROCm masquerades as CUDA in PyTorch — torch.cuda.is_available() is True on
     LUMI-G — so two of the three targets share this branch.
@@ -72,7 +72,7 @@ def probe_device(device: torch.device) -> bool:
 
 
 def probe_dtypes(device: torch.device) -> None:
-    """Which precisions this backend can actually do. lumi-env docs/workflow/20 R2 and R3."""
+    """Which precisions this backend can actually do."""
     print(SEP)
 
     # R3: float64 is unsupported on MPS, and it raises rather than falling back.

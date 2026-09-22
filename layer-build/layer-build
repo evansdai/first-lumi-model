@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""layer-build -- put the packages a base container is missing into ONE SquashFS layer.
+
+    layer-build --base <pinned.sif> --env <environment.yml|conda-env-export.json> --id <name>
+
+Read MANUAL.md for the contract, the conflict rules and the exit codes; `--help` for the flags.
+
+The split in this file is deliberate, and it is the whole design:
+
+  * the middle is pure: parse the environment, compare it with what the image already has, decide
+    the plan. No I/O, no subprocess, no clock. That is what the tests exercise, and it is what makes
+    "fail loudly on a conflict" a rule you can read rather than a behaviour you have to trust.
+  * the edges do I/O: singularity, mksquashfs, the filesystem, one function each, each failing
+    loudly instead of guessing.
+"""
+
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Dict, List, NamedTuple, Optional, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+
+TOOL = "layer-build"
+VERSION = "0.1.0"
+
+# Exit codes are part of the interface: a caller -- human or agent -- branches on them.
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_CONFLICT = 3
+EXIT_BUILD = 4
+EXIT_ENVIRONMENT = 5
+
+# Packages a venv built with --system-site-packages can only *shadow*, never replace. Installing
+# one into the layer is how a working ROCm job breaks: the image's torch is compiled against the
+# image's own numpy and its own ROCm runtime.
+STACK_PACKAGES = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "pytorch-triton",
+    "triton",
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "h5py",
+    "scikit-learn",
+    "tensorboard",
+    "transformers",
+    "vllm",
+    "numba",
+    "llvmlite",
+    "pyarrow",
+)
+
+# Not installable into a layer at all: these ARE the image's runtime. Asking for one is a request
+# for a different container, not for a layer.
+NON_LAYERABLE = (
+    "python", "pip", "setuptools", "wheel", "conda", "mamba", "virtualenv",
+    # conda's own compiler-runtime packages: never on PyPI, and always in a resolved export.
+    # Listed normalized, because that is what the comparison uses.
+    "libgcc-ng", "libstdcxx-ng", "libgomp", "ld-impl-linux-64",
+)
+
+# A layer id becomes a file name and a directory name, so it is restricted to what is safe there.
+LAYER_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+NAME_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9._+-]*)\s*(.*)$")  # `_libgcc_mutex` is a real name
+
+
+# --------------------------------------------------------------------------------------
+# pure logic: requirements, versions, classification
+# --------------------------------------------------------------------------------------
+
+
+class Requirement(NamedTuple):
+    """One package the environment asks for. `spec` is a pip specifier, or "" for "any"."""
+
+    name: str
+    spec: str = ""
+    source: str = "conda"  # "conda" or "pip"
+
+    @property
+    def key(self) -> str:
+        """The normalized (PEP 503) name: how the two sides of the comparison are matched."""
+        return normalize_name(self.name)
+
+
+class Conflict(NamedTuple):
+    """A request this tool refuses, with the reason a reader needs in order to act on it."""
+
+    package: str
+    kind: str  # non-pip | shadow-stack | version-drift | stack-drift | pip-check
+    requested: str
+    image_version: str
+    why: str
+
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            "package": self.package,
+            "kind": self.kind,
+            "requested": self.requested,
+            "image_version": self.image_version,
+            "why": self.why,
+        }
+
+
+class Plan(object):
+    """The decision: what the image satisfies, what to install, what is refused."""
+
+    def __init__(self):
+        self.satisfied = []  # type: List[Tuple[Requirement, str]]
+        self.missing = []  # type: List[Requirement]
+        self.conflicts = []  # type: List[Conflict]
+        self.allowed_shadow = []  # type: List[str]
+
+    def installable(self) -> List[str]:
+        """The pip arguments for the install step: only what the image does not satisfy."""
+        return [f"{r.name}{r.spec}" for r in self.missing]
+
+
+def normalize_name(name: str) -> str:
+    """PEP 503: case-insensitive, and runs of -_. collapse to a single -."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def version_key(version: str) -> tuple:
+    """A comparable key: (release as written, (pre/post rank, serial), local label)."""
+    core, _, local = version.partition("+")
+    core, _, post = core.partition(".post")
+    match = re.match(r"^(?P<release>[0-9][0-9.]*)(?P<pre>.*)$", core)
+    if not match:
+        return ((), (0, 0), local)
+    release = tuple(int(part) for part in match.group("release").rstrip(".").split("."))
+    pre = match.group("pre")
+    rank, serial = 0, 0
+    if pre:
+        word = re.match(r"^[A-Za-z]+", pre)
+        rank = {"dev": -4, "a": -3, "b": -2, "rc": -1, "c": -1}.get(
+            word.group(0).lower() if word else "", -1
+        )
+        digits = re.search(r"(\d+)", pre)
+        serial = int(digits.group(1)) if digits else 0
+    if post:
+        rank = 1
+        digits = re.search(r"(\d+)", post)
+        serial = int(digits.group(1)) if digits else 0
+    return (release, (rank, serial), local)
+
+
+def compare_versions(a: tuple, b: tuple) -> int:
+    """Order two keys: -1, 0 or 1. The release is padded with zeros, and the local label is
+    ignored -- `1.0`, `1.0.0` and the image's `2.10.0+rocm7.0` compare as the release they are."""
+    width = max(len(a[0]), len(b[0]))
+    left = a[0] + (0,) * (width - len(a[0]))
+    right = b[0] + (0,) * (width - len(b[0]))
+    if left != right:
+        return -1 if left < right else 1
+    if a[1] != b[1]:
+        return -1 if a[1] < b[1] else 1
+    return 0
+
+
+def same_version(have: tuple, want: tuple) -> bool:
+    """Equality, including the local label when the *specifier* names one.
+
+    A specifier without a local label (`==2.10.0`) therefore matches the image's ROCm build
+    (`2.10.0+rocm7.0`), which is what a LUMI user means; `==1.0+cpu` does not match `1.0+rocm`.
+    """
+    if compare_versions(have, want) != 0:
+        return False
+    return not want[2] or have[2] == want[2]
+
+
+def satisfies(version: str, spec: str) -> bool:
+    """Does `version` satisfy a comma-separated clause list? An empty spec means "any"."""
+    if not spec.strip():
+        return True
+    have = version_key(version)
+    for clause in spec.split(","):
+        clause = clause.strip()
+        if not clause or clause == "*":
+            continue
+        for op in ("===", "==", "!=", ">=", "<=", "~=", ">", "<"):
+            if clause.startswith(op):
+                wanted = clause[len(op) :].strip()
+                break
+        else:
+            op, wanted = "==", clause
+        if wanted.endswith(".*"):
+            prefix = version_key(wanted[:-2])[0]
+            matches = have[0][: len(prefix)] == prefix
+            if op in ("==", "==="):
+                if not matches:
+                    return False
+                continue
+            if op == "!=":
+                if matches:
+                    return False
+                continue
+            return False  # a range against a wildcard is not something we guess at
+        want = version_key(wanted)
+        order = compare_versions(have, want)
+        if op in ("==", "===") and not same_version(have, want):
+            return False
+        if op == "!=" and same_version(have, want):
+            return False
+        if op == ">=" and order < 0:
+            return False
+        if op == "<=" and order > 0:
+            return False
+        if op == ">" and order <= 0:
+            return False
+        if op == "<" and order >= 0:
+            return False
+        if op == "~=":
+            # PEP 440's compatible release: >= the version, and the same prefix up to its last
+            # component *as written* -- so `~=1.4.0` allows 1.4.x and not 1.9.
+            parts = want[0]
+            if len(parts) < 2:
+                return False  # `~=1` is not a compatible-release specifier
+            prefix = parts[: len(parts) - 1]
+            if order < 0 or have[0][: len(prefix)] != prefix:
+                return False
+    return True
+
+
+CLAUSE_RE = re.compile(r"^(?P<op>===|==|!=|<=|>=|~=|=|<|>)?(?P<version>[0-9][A-Za-z0-9._*+!-]*)$")
+
+
+def conda_spec_to_pip(rest: str) -> str:
+    """The text after the package name in a conda entry, as a pip specifier.
+
+    `=1.8.0` and ` 1.8.0` become `==1.8.0`; `=1.8` becomes `>=1.8,<1.9`, because conda's `=` is a
+    prefix match; `>=1.0` is passed through; several clauses survive (`>=1,<2`). A build string
+    (`=1.8.0=py312_0`) is dropped and a build glob (`=*=*pthreads*`) means "any version": pip has no
+    way to express a build constraint, so the version is what gets compared, and MANUAL.md says so.
+
+    Anything the grammar does not cover is an error. Truncating a constraint would *weaken* it --
+    `numpy>=1,<2` silently becoming `>=1` is exactly the fail-open case this tool exists to prevent.
+    """
+    rest = rest.strip()
+    if not rest or rest.startswith("*"):
+        return ""
+    converted = []  # type: List[str]
+    for clause in rest.split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if clause.startswith("=*"):
+            continue  # `=*=*pthreads*`: a build glob, which pip cannot express
+        # `=1.8.0=py312_0` carries a build string; `==1.8.0` does not, so only the bare `=` form
+        # gets its build field stripped.
+        if clause.count("=") >= 2 and not clause.startswith(("==", "===", "!=", "<=", ">=", "~=")):
+            clause = clause[: clause.index("=", clause.index("=") + 1)]
+        match = CLAUSE_RE.match(clause)
+        if not match:
+            raise ValueError(f"cannot read this version constraint: {clause!r}")
+        op, version = match.group("op"), match.group("version")
+        if op in ("<", ">", "<=", ">=", "!=", "==", "===", "~="):
+            converted.append(f"{op}{version}")
+            continue
+        if version.endswith(".*"):
+            converted.append(f"=={version}")
+            continue
+        parts = version.split(".")
+        if len(parts) >= 3:
+            converted.append(f"=={version}")
+            continue
+        try:
+            upper = parts[:-1] + [str(int(parts[-1]) + 1)]
+        except ValueError:
+            converted.append(f"=={version}")
+            continue
+        converted.append(f">={version},<{'.'.join(upper)}")
+    return ",".join(converted)
+
+
+def parse_requirement_line(line: str, source: str) -> Optional[Requirement]:
+    """One entry: `name`, `name=1.8`, `name==1.8`, `name>=1.8,<2`, or `name 1.8 build`."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if ";" in line:
+        raise ValueError(f"environment markers are not supported here: {line!r}")
+    if "::" in line:
+        line = line.split("::", 1)[1].strip()  # `conda-forge::numpy=1.26`: not our business
+    match = NAME_RE.match(line)
+    if not match:
+        raise ValueError(f"cannot read this package line: {line!r}")
+    name, rest = match.group(1), match.group(2).strip()
+    rest = rest.split("#")[0].strip()  # a trailing comment
+    if source == "pip":
+        return Requirement(name=name, spec=rest, source=source)
+    # `numpy 1.26.4 py312_0` is a resolved conda line: the first token is the version, the rest
+    # is a build string, and a build string is not something pip can be told about.
+    return Requirement(name=name, spec=conda_spec_to_pip(rest.split()[0] if rest else ""), source=source)
+
+
+def parse_environment(text: str, origin: str) -> Tuple[str, List[Requirement]]:
+    """Read `conda env export --json`, `conda list --json`, or an `environment.yml`.
+
+    Returns (environment name, requirements). Raises ValueError when the input is a shape this
+    parser does not cover: guessing here would build an environment nobody asked for, which is
+    worse than stopping.
+    """
+    if text.lstrip().startswith(("{", "[")):
+        return _parse_json_environment(text, origin)
+    return _parse_yaml_environment(text, origin)
+
+
+def _parse_json_environment(text: str, origin: str) -> Tuple[str, List[Requirement]]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{origin}: not valid JSON: {exc}") from exc
+    requirements = []  # type: List[Requirement]
+    if isinstance(data, list):  # `conda list --json`: the resolved set
+        for entry in data:
+            if not isinstance(entry, dict) or "name" not in entry:
+                raise ValueError(f"{origin}: expected a list of package objects")
+            requirements.append(
+                Requirement(
+                    name=str(entry["name"]),
+                    spec=f"=={entry['version']}" if entry.get("version") else "",
+                    source="conda",
+                )
+            )
+        return ("", requirements)
+    if not isinstance(data, dict):
+        raise ValueError(f"{origin}: expected an object or a list")
+    dependencies = data.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise ValueError(f"{origin}: `dependencies` must be a list")
+    for entry in dependencies:
+        if isinstance(entry, str):
+            parsed = parse_requirement_line(entry, "conda")
+            if parsed:
+                requirements.append(parsed)
+        elif isinstance(entry, dict) and "pip" in entry:
+            if not isinstance(entry["pip"], list):
+                raise ValueError(f"{origin}: the `pip` entry must be a list")
+            for pip_line in entry["pip"]:
+                if not isinstance(pip_line, str):
+                    raise ValueError(f"{origin}: a pip entry must be a string, got {pip_line!r}")
+                parsed = parse_requirement_line(pip_line, "pip")
+                if parsed:
+                    requirements.append(parsed)
+        else:
+            raise ValueError(f"{origin}: unsupported entry in dependencies: {entry!r}")
+    if not requirements:
+        raise ValueError(f"{origin}: no packages found")
+    return (str(data.get("name", "")), requirements)
+
+
+def _parse_yaml_environment(text: str, origin: str) -> Tuple[str, List[Requirement]]:
+    """The `environment.yml` subset: `name`, `dependencies`, and the nested `pip:` list.
+
+    Anything else -- anchors, flow style, multiple documents -- is refused, because a parser that
+    half-understands YAML builds an environment nobody asked for. `channels:`, `variables:` and
+    other sections are ignored, since they do not describe packages to install.
+    """
+    name = ""
+    requirements = []  # type: List[Requirement]
+    section = ""
+    in_pip = False
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#")[0].rstrip()
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("- "):
+            if section != "dependencies":
+                continue  # a channels: or variables: list item
+            item = line.strip()[2:].strip()
+            indent = len(line) - len(line.lstrip())
+            if item.endswith(":"):  # `- pip:` opens the pip list; `- pip` is the package itself
+                in_pip = item.rstrip(":") == "pip"
+                continue
+            if ": " in item and not item.startswith(("=", "<", ">", "!", "~")):
+                continue  # a nested mapping inside a list item is not a package
+            parsed = parse_requirement_line(item, "pip" if in_pip and indent >= 4 else "conda")
+            if not (in_pip and indent >= 4):
+                in_pip = False
+            if parsed:
+                requirements.append(parsed)
+            continue
+        if ":" not in line:
+            raise ValueError(f"{origin}:{number}: expected `key: value`, got {raw.strip()!r}")
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if line.startswith((" ", "\t")):
+            continue  # a nested mapping inside a section we ignore
+        in_pip = False
+        if key == "name":
+            name = value.strip()
+            section = ""
+        elif key == "dependencies":
+            section = "dependencies"
+        else:
+            section = key
+    if not requirements:
+        raise ValueError(f"{origin}: no packages found")
+    return (name, requirements)
+
+
+def classify(
+    requirements: List[Requirement], image: Dict[str, str], allow_shadow: List[str]
+) -> Plan:
+    """The rule that decides the whole tool: install the delta, refuse the shadows.
+
+    `image` maps normalized package name -> the version the image already has. A package the image
+    satisfies is left alone. A package the image does not have is installed. A package the image
+    has at a version the environment does not accept is a conflict, because a layer can only
+    shadow it -- and shadowing the image's numpy is how a working ROCm job breaks.
+    """
+    allowed = {normalize_name(name) for name in allow_shadow}
+    plan = Plan()
+    for requirement in requirements:
+        key = requirement.key
+        if requirement.name.startswith("_") or key in NON_LAYERABLE:
+            plan.conflicts.append(
+                Conflict(
+                    package=requirement.name,
+                    kind="non-pip",
+                    requested=requirement.spec,
+                    image_version=image.get(key, ""),
+                    why=(
+                        "this is the environment's own runtime or a conda system package, and a "
+                        "layer cannot provide it. Layer only what you ADD to the image; a whole "
+                        "conda environment is route 2 or 3 -- build your own container."
+                    ),
+                )
+            )
+            continue
+        image_version = image.get(key)
+        if image_version is None:
+            if key in STACK_PACKAGES and key not in allowed:
+                plan.conflicts.append(
+                    Conflict(
+                        package=requirement.name,
+                        kind="shadow-stack",
+                        requested=requirement.spec,
+                        image_version="",
+                        why=(
+                            "the image does not ship this, but it belongs to the accelerator stack; "
+                            "installing it into the layer would shadow what the image's torch was "
+                            "built against."
+                        ),
+                    )
+                )
+            else:
+                if key in STACK_PACKAGES:
+                    plan.allowed_shadow.append(requirement.name)
+                plan.missing.append(requirement)
+            continue
+        if satisfies(image_version, requirement.spec):
+            plan.satisfied.append((requirement, image_version))
+            continue
+        if key in allowed:
+            plan.allowed_shadow.append(requirement.name)
+            plan.missing.append(requirement)
+            continue
+        plan.conflicts.append(
+            Conflict(
+                package=requirement.name,
+                kind="version-drift",
+                requested=requirement.spec,
+                image_version=image_version,
+                why=(
+                    f"the image has {image_version}, which does not satisfy "
+                    f"{requirement.spec or 'any'}; installing the requested version into the layer "
+                    f"shadows the image's copy. Use --allow-shadow {requirement.name} if you have "
+                    "decided that is what you want."
+                ),
+            )
+        )
+    return plan
+
+
+# --------------------------------------------------------------------------------------
+# effects: one function per edge, each failing loudly
+# --------------------------------------------------------------------------------------
+
+
+class ToolError(Exception):
+    """A failure with an exit code and a message meant for a human or an agent."""
+
+    def __init__(self, message: str, code: int = EXIT_BUILD):
+        super().__init__(message)
+        self.code = code
+
+
+def read_env_file(path: str) -> str:
+    """Read the environment file, or stop with a usage error: a missing file is not a traceback."""
+    try:
+        return Path(path).read_text()
+    except OSError as exc:
+        raise ToolError(f"cannot read {path}: {exc}", EXIT_USAGE) from exc
+
+
+def run(argv: List[str], *, timeout: int = 3600) -> str:
+    try:
+        completed = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=timeout, check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ToolError(f"{argv[0]} not found on PATH", EXIT_ENVIRONMENT) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"timed out after {timeout}s: {' '.join(argv)}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise ToolError(f"command failed ({completed.returncode}): {' '.join(argv)}\n{detail}")
+    return completed.stdout
+
+
+def in_container() -> bool:
+    """True inside a container, where singularity cannot start another one."""
+    return bool(os.environ.get("SINGULARITY_CONTAINER") or os.environ.get("APPTAINER_CONTAINER"))
+
+
+def image_packages(base: str, python: str) -> Dict[str, str]:
+    """What the image already has, as normalized package name -> version."""
+    raw = run(["singularity", "exec", "--no-home", base, python, "-m", "pip", "list", "--format=json"])
+    try:
+        listed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"`pip list --format=json` inside the image was not JSON: {exc}") from exc
+    packages = {}  # type: Dict[str, str]
+    for entry in listed:
+        packages[normalize_name(entry["name"])] = entry.get("version", "")
+    if not packages:
+        raise ToolError("the image reported no packages -- refusing to plan against an empty list")
+    return packages
+
+
+def pip_check_failed(returncode: int) -> bool:
+    """`pip check` exits 1 when it FINDS conflicts, which is data; anything else is an error."""
+    return returncode not in (0, 1)
+
+
+def pip_check(base: str, python: str, layer: Optional[str]) -> str:
+    """`pip check` for the image alone, or for the image with the layer mounted at /user-software.
+
+    `pip check` exits 1 when it *finds* conflicts, and the AI image has pre-existing ones by that
+    standard (it ships vllm and a compressed-tensors that vllm's metadata disagrees with). Exit 1 is
+    therefore data to compare, not a failure; any other status is a real error.
+    """
+    argv = ["singularity", "exec", "--no-home"]
+    if layer is not None:
+        argv += ["-B", f"{layer}:/user-software:image-src=/"]
+    argv += [base, python, "-m", "pip", "check"]
+    try:
+        completed = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=900, check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ToolError(f"{argv[0]} not found on PATH", EXIT_ENVIRONMENT) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"timed out after 900s: {' '.join(argv)}") from exc
+    if pip_check_failed(completed.returncode):
+        raise ToolError(
+            f"`pip check` failed ({completed.returncode}): {' '.join(argv)}\n"
+            f"{(completed.stderr or completed.stdout).strip()}"
+        )
+    return completed.stdout or completed.stderr
+
+
+def check_regressions(before: str, after: str) -> None:
+    """Compare `pip check` with and without the layer. The image's own noise is not ours.
+
+    The AI image is inconsistent by `pip check`'s own standard before any layer exists (it ships
+    vllm and a compressed-tensors that vllm's metadata disagrees with). Asking differentially is
+    what makes the question answerable: did *our* packages add a conflict?
+    """
+    known = {line for line in before.splitlines() if line.strip()}
+    new_lines = [line for line in after.splitlines() if line.strip() and line not in known]
+    if new_lines:
+        raise ToolError(
+            "the layer would add dependency conflicts the image alone does not have:\n  "
+            + "\n  ".join(new_lines)
+            + "\n(the image's own pre-existing conflicts are not counted -- see MANUAL.md)",
+            EXIT_CONFLICT,
+        )
+
+
+def import_probe(names: List[str]) -> str:
+    """A program that imports every requested distribution, by the names it actually provides.
+
+    The distribution-to-module mapping comes from the layer's own metadata, so nothing here is
+    specific to any one package or example. A distribution whose modules cannot be found is a
+    failure: an unverifiable install is not a verified one.
+    """
+    return (
+        "import importlib, importlib.metadata as md, re, sys\n"
+        f"names = {names!r}\n"
+        "def norm(n):\n"
+        "    return re.sub(r'[-_.]+', '-', n).strip().lower()\n"
+        "dist_to_modules = {}\n"
+        "for module, dists in md.packages_distributions().items():\n"
+        "    for dist in dists:\n"
+        "        dist_to_modules.setdefault(norm(dist), []).append(module)\n"
+        "bad = []\n"
+        "for name in names:\n"
+        "    modules = dist_to_modules.get(norm(name))\n"
+        "    if not modules:\n"
+        "        bad.append(f'{name}: installed, but reports no importable module')\n"
+        "        continue\n"
+        "    for module in sorted(set(modules)):\n"
+        "        try:\n"
+        "            importlib.import_module(module)\n"
+        "        except Exception as exc:\n"
+        "            bad.append(f'{name} -> {module}: {exc!r}')\n"
+        "print('\\n'.join(bad))\n"
+        "sys.exit(1 if bad else 0)\n"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# the build
+# --------------------------------------------------------------------------------------
+
+
+class Options(object):
+    """The CLI's settled inputs. A plain class: the tool must run on a login node's python3."""
+
+    def __init__(self, base, env_file, layer_id, out, python, allow_shadow, dry_run,
+                 as_json, export_to, base_sha256, timeout, keep_stage):
+        self.base = base
+        self.env_file = env_file
+        self.layer_id = layer_id
+        self.out = out
+        self.python = python
+        self.allow_shadow = allow_shadow
+        self.dry_run = dry_run
+        self.as_json = as_json
+        self.export_to = export_to
+        self.base_sha256 = base_sha256
+        self.timeout = timeout
+        self.keep_stage = keep_stage
+
+
+def record_export(path: Path, value: str) -> Tuple[bool, str]:
+    """Point an env file's MODEL_LAYER line at this layer, verified before it is installed.
+
+    The file is sourced by the user's shells, so it is executable text: the rewrite is installed
+    only after a subshell has sourced it and printed the value back. A file that exits early, or a
+    value the shell cannot round-trip, is refused rather than half-written. The layer is already
+    published by this point, so a failure here is a message, never a failed build.
+    """
+    line = f"export MODEL_LAYER={shlex.quote(value)}"
+    if path.is_symlink() or not path.is_file() or not os.access(path, os.R_OK | os.W_OK):
+        return False, f"no writable, regular env file at {path}"
+    original = path.read_text()
+    lines = original.splitlines()
+    if any(existing.startswith("export MODEL_LAYER=") for existing in lines):
+        rewritten = "\n".join(
+            line if existing.startswith("export MODEL_LAYER=") else existing for existing in lines
+        )
+    else:
+        rewritten = original.rstrip("\n") + "\n\n" + line
+    mode = path.stat().st_mode & 0o7777
+
+    handle = tempfile.NamedTemporaryFile("w", dir=str(path.parent), prefix=path.name + ".", delete=False)
+    try:
+        with handle:
+            handle.write(rewritten + "\n")
+        temp = Path(handle.name)
+        os.chmod(temp, mode)
+        verify = subprocess.run(
+            [
+                "bash",
+                "-c",
+                # mirror the consumer: workflow/profiles/lumi-g/train.sbatch sources env.sh
+                # under `set -euo pipefail`, so the verification does too, and captures the status
+                # explicitly because a sourced file may turn errexit off for itself.
+                'set -euo pipefail; . "$1" >/dev/null 2>&1; st=$?; printf "V=%s S=%s" "${MODEL_LAYER:-}" "$st"',
+                "_",
+                str(temp),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=False,
+        )
+        # The status of the source command is captured explicitly: a file may run `set +e`
+        # itself, so errexit in the verification shell is not a policy we can rely on.
+        if verify.stdout != f"V={value} S=0":
+            return False, f"{path} did not source cleanly and round-trip the value; left as it was"
+        temp.replace(path)
+    finally:
+        if Path(handle.name).exists():
+            Path(handle.name).unlink()  # only the temporary file this function created
+    return True, line
+
+
+def publish(partial: Path, sqsh: Path, freeze_text: str, manifest_text: str) -> Dict[str, str]:
+    """Turn the packed `.partial` layer and its records into the published set.
+
+    The layer is the commit marker: the records are renamed into place first and the layer last, so a
+    layer that exists always has complete records beside it. An interrupted publication can leave
+    final records beside a `.partial` layer, and any of them blocks reuse of that layer id -- which
+    is what makes the failure safe instead of silent.
+    """
+    artifacts = {
+        "layer": str(sqsh),
+        "freeze": str(sqsh.with_name(sqsh.name + ".freeze.txt")),
+        "manifest": str(sqsh.with_name(sqsh.name + ".manifest.txt")),
+        "sha256": str(sqsh.with_name(sqsh.name + ".sha256")),
+    }
+    staged = {name: Path(f"{path}.partial") for name, path in artifacts.items()}
+    staged["freeze"].write_text(freeze_text)
+    staged["manifest"].write_text(manifest_text)
+    digests = run(["sha256sum", str(partial), str(staged["freeze"]), str(staged["manifest"])])
+    for name in ("layer", "freeze", "manifest"):  # the records name the final paths
+        digests = digests.replace(str(staged[name]), str(artifacts[name]))
+    staged["sha256"].write_text(digests)
+    staged["freeze"].replace(artifacts["freeze"])
+    staged["manifest"].replace(artifacts["manifest"])
+    staged["sha256"].replace(artifacts["sha256"])
+    partial.replace(sqsh)
+    return artifacts
+
+
+def build(options: Options) -> Tuple[Plan, Dict]:
+    base = Path(options.base)
+    if not base.is_file():
+        raise ToolError(f"no base image at {base}", EXIT_USAGE)
+    if options.base_sha256:
+        # A pin whose hash is never checked is not a pin: read the whole image, once, and stop
+        # if it is not the image step 2 recorded. Optional, because step 2 makes it optional.
+        sha_file = Path(options.base_sha256)
+        if not sha_file.is_file():
+            raise ToolError(f"no checksum file at {sha_file}", EXIT_USAGE)
+        recorded = sha_file.read_text().split()
+        expected = recorded[0] if recorded else ""
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            raise ToolError(f"{sha_file} does not start with a sha256 digest", EXIT_USAGE)
+        actual = run(["sha256sum", options.base], timeout=options.timeout).split()[0]
+        if actual.lower() != expected.lower():
+            named = recorded[-1] if len(recorded) > 1 else "?"
+            raise ToolError(
+                "the base image is not the pinned one:\n"
+                f"  {options.base}\n  has    {actual}\n  pinned {expected}\n"
+                f"  (the digest comes from {sha_file}, which names {named})",
+                EXIT_USAGE,
+            )
+        base_sha = actual
+    else:
+        base_sha = "unverified"
+    env_name, requirements = parse_environment(read_env_file(options.env_file), options.env_file)
+
+    # Resolve --out now, before any container work: the records must name absolute paths, so that
+    # `sha256sum -c` from a job's directory means the same thing as it does here.
+    out_dir = Path(options.out).resolve()
+    sqsh = out_dir / f"{options.layer_id}.sqsh"
+    partial = sqsh.with_name(sqsh.name + ".partial")
+    final = [
+        sqsh,
+        sqsh.with_name(sqsh.name + ".freeze.txt"),
+        sqsh.with_name(sqsh.name + ".manifest.txt"),
+        sqsh.with_name(sqsh.name + ".sha256"),
+    ]
+    if any(p.exists() for p in final) or any(Path(f"{p}.partial").exists() for p in final):
+        raise ToolError(
+            f"{sqsh} or one of its records already exists (or a `.partial` from an interrupted "
+            "build). A published layer is immutable: pick a new --id, or move the old one aside.",
+            EXIT_USAGE,
+        )
+
+    image = image_packages(options.base, options.python)
+    plan = classify(requirements, image, options.allow_shadow)
+
+    report: dict = {
+        "tool": TOOL,
+        "version": VERSION,
+        "base_image": options.base,
+        "env_file": options.env_file,
+        "environment": env_name,
+        "layer_id": options.layer_id,
+        "python": options.python,
+        "image_packages": len(image),
+        "satisfied": sorted(r.name for r, _ in plan.satisfied),
+        "missing": sorted(r.name for r in plan.missing),
+        "allowed_shadow": sorted(plan.allowed_shadow),
+        "conflicts": [c.as_dict() for c in plan.conflicts],
+    }
+    if plan.conflicts:
+        raise Conflicts(plan, report)
+    if options.dry_run:
+        report["status"] = "dry-run"
+        return plan, report
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if options.keep_stage:
+        stage_root = out_dir / f"{options.layer_id}.stage"
+        if stage_root.exists():
+            raise ToolError(
+                f"staging directory already exists: {stage_root} -- move it aside, or drop "
+                "--keep-stage and let the tool use a fresh one",
+                EXIT_USAGE,
+            )
+        stage_root.mkdir(parents=True)
+    else:
+        stage_root = Path(tempfile.mkdtemp(prefix="layer-build."))  # node-local /tmp: RAM on a node
+    venv = stage_root / "venv"
+    venv.mkdir(parents=True, exist_ok=True)  # singularity needs the bind source to exist
+    print(f"staging {stage_root}", file=sys.stderr)  # so a failed build leaves a path you can find
+
+    # The image's own `pip check` noise, measured before anything of ours exists.
+    base_check = pip_check(options.base, options.python, None)
+
+    print(f"== building {len(plan.missing)} package(s) into {sqsh} ==", file=sys.stderr)
+    mount = ["-B", f"{venv}:/user-software:rw"]
+    run(
+        ["singularity", "exec", "--no-home", *mount, "--pwd", "/", options.base, options.python,
+         "-m", "venv", "/user-software", "--system-site-packages"],
+        timeout=options.timeout,
+    )
+    if plan.installable():
+        run(
+            ["singularity", "exec", "--no-home", *mount, "--pwd", "/", options.base,
+             "/user-software/bin/python", "-m", "pip", "install", "--no-cache-dir",
+             *plan.installable()],
+            timeout=options.timeout,
+        )
+
+    # Pack first: every check below runs against the artifact a job will mount, not against the
+    # directory it was built from. Testing the directory tests something no job ever sees.
+    run(["mksquashfs", str(venv), str(partial), "-noappend", "-processors", "1", "-all-root",
+         "-action", "chmod(a+rX) @true"])
+
+    layer_python = ["singularity", "exec", "--no-home", "-B", f"{partial}:/user-software:image-src=/",
+                    options.base, "/user-software/bin/python"]
+
+    # The layer must not have changed any part of the image's accelerator stack. This is the
+    # check that catches a transitive upgrade pip decided to make on its own.
+    after = {normalize_name(e["name"]): e.get("version", "") for e in json.loads(run([*layer_python, "-m", "pip", "list", "--format=json"]))}
+    allowed_stack = {normalize_name(name) for name in plan.allowed_shadow}
+    drifted = [
+        f"{key}: image {value}, layer {after.get(key, 'absent')}"
+        for key, value in image.items()
+        # A package the user explicitly allowed is excluded here on purpose: the flag means what
+        # it says, and the manifest records it.
+        if key in STACK_PACKAGES and key not in allowed_stack and after.get(key, "") != value
+    ]
+    moved = sorted(allowed_stack & {key for key in image if key in STACK_PACKAGES})
+    if moved:
+        print(
+            f"note: the accelerator stack was moved deliberately: {', '.join(moved)} "
+            "(recorded in the manifest)",
+            file=sys.stderr,
+        )
+    if drifted:
+        raise ToolError(
+            "the layer changed part of the image's accelerator stack:\n  " + "\n  ".join(drifted),
+            EXIT_CONFLICT,
+        )
+
+    # Every requested distribution must be importable from the layer's interpreter.
+    names = sorted({r.name for r in plan.missing} | {r.name for r, _ in plan.satisfied})
+    try:
+        run([*layer_python, "-c", import_probe(names)], timeout=options.timeout)
+    except ToolError as exc:
+        raise ToolError(f"a requested package is not importable from the layer:\n{exc}", EXIT_BUILD) from exc
+
+    freeze = run([*layer_python, "-m", "pip", "freeze", "--all"])
+
+    # The differential gate: did OUR packages add a conflict the image alone does not have?
+    # It runs against the packed layer, which is what a job mounts.
+    check_regressions(base_check, pip_check(options.base, options.python, str(partial)))
+    manifest_text = "\n".join(
+        [
+            f"layer={sqsh}",
+            f"layer_id={options.layer_id}",
+            f"tool={TOOL} {VERSION}",
+            f"base_image={options.base}",
+            f"base_image_sha256={base_sha}",
+            f"requirements={options.env_file}",
+            f"created={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            f"installed={','.join(plan.installable()) or '(none)'}",
+            f"allow_shadow={','.join(sorted(plan.allowed_shadow)) or '(none)'}",
+            "",
+        ]
+    )
+    artifacts = publish(partial, sqsh, freeze, manifest_text)
+    if not options.keep_stage:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
+    report["artifacts"] = artifacts
+    report["status"] = "built"
+    if options.export_to:
+        ok, detail = record_export(Path(options.export_to), str(sqsh))
+        report["export_to"] = {"file": options.export_to, "ok": ok, "detail": detail}
+    return plan, report
+
+
+class Conflicts(ToolError):
+    """Refused: the plan would shadow the image. Carries the report so `--json` stays truthful."""
+
+    def __init__(self, plan: Plan, report: dict):
+        super().__init__(
+            f"{len(plan.conflicts)} conflict(s) -- nothing was built. Read the reasons below; "
+            "--allow-shadow PKG overrides one deliberately.",
+            EXIT_CONFLICT,
+        )
+        self.plan = plan
+        self.report = report
+
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
+
+def parse_args(argv: List[str]) -> Options:
+    parser = argparse.ArgumentParser(
+        prog=TOOL,
+        description=(
+            "Build the packages a base container is missing into one SquashFS layer, refusing "
+            "anything that would shadow the image's own stack. See MANUAL.md."
+        ),
+        epilog="exit codes: 0 ok, 2 usage/input, 3 conflict, 4 build/verify, 5 environment",
+    )
+    parser.add_argument("--base", required=True, help="the pinned base image (.sif)")
+    parser.add_argument(
+        "--base-sha256", metavar="FILE",
+        help="a `sha256sum -c` file for --base; a mismatch stops the build (see step 2)",
+    )
+    parser.add_argument(
+        "--env", dest="env_file", required=True,
+        help="the environment: environment.yml, `conda env export --json`, or `conda list --json`",
+    )
+    parser.add_argument("--id", dest="layer_id", help="layer id (default: <env name>-<date>)")
+    parser.add_argument("--out", default=".", help="directory for the .sqsh (default: .)")
+    parser.add_argument("--python", default="python", help="interpreter inside the image (default: python)")
+    parser.add_argument(
+        "--allow-shadow", action="append", default=[], metavar="PKG",
+        help="install PKG even though the image has a different version (recorded in the manifest)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="plan and report; build nothing")
+    parser.add_argument("--json", dest="as_json", action="store_true", help="machine-readable report")
+    parser.add_argument(
+        "--export-to", metavar="FILE",
+        help="after publishing, point FILE's MODEL_LAYER line at the new layer",
+    )
+    parser.add_argument("--timeout", type=int, default=3600, help="seconds per command")
+    parser.add_argument("--keep-stage", action="store_true", help="keep the staging directory")
+    parser.add_argument("--version", action="version", version=f"{TOOL} {VERSION}")
+    args = parser.parse_args(argv)
+
+    if args.layer_id and (not LAYER_ID_RE.match(args.layer_id) or args.layer_id in (".", "..")):
+        raise ToolError(
+            f"invalid --id {args.layer_id!r}: letters, digits, dot, underscore or dash only "
+            "(it becomes a file name)",
+            EXIT_USAGE,
+        )
+    if not args.layer_id:
+        name, _ = parse_environment(read_env_file(args.env_file), args.env_file)
+        args.layer_id = f"{name or 'layer'}-{datetime.now(timezone.utc).strftime('%Y%m%d')}"
+        if not LAYER_ID_RE.match(args.layer_id):
+            raise ToolError(f"cannot derive a layer id from {args.env_file!r}; pass --id", EXIT_USAGE)
+    return Options(
+        base=args.base,
+        env_file=args.env_file,
+        layer_id=args.layer_id,
+        out=args.out,
+        python=args.python,
+        allow_shadow=args.allow_shadow,
+        dry_run=args.dry_run,
+        as_json=args.as_json,
+        export_to=args.export_to,
+        base_sha256=args.base_sha256,
+        timeout=args.timeout,
+        keep_stage=args.keep_stage,
+    )
+
+
+def print_report(report: Dict, as_json: bool, plan: Optional[Plan]) -> None:
+    if as_json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    print(f"{TOOL} {VERSION}")
+    print(f"  base        {report['base_image']}")
+    print(f"  environment {report['env_file']}  ({report['image_packages']} packages in the image)")
+    print(f"  satisfied   {', '.join(report['satisfied']) or '(none)'}")
+    print(f"  to install  {', '.join(report['missing']) or '(none)'}")
+    if report.get("allowed_shadow"):
+        print(f"  allowed     {', '.join(report['allowed_shadow'])} (shadowing on purpose)")
+    for conflict in report["conflicts"]:
+        print(f"  CONFLICT    {conflict['package']} [{conflict['kind']}] {conflict['why']}")
+    if report.get("status") == "built":
+        print(f"  published   {report['artifacts']['layer']}")
+        print(f"  manifest    {report['artifacts']['manifest']}")
+    if "export_to" in report:
+        where = report["export_to"]
+        print(f"  env file    {where['detail'] if where['ok'] else 'NOT updated: ' + where['detail']}")
+    if plan and plan.missing:
+        layer = report.get("artifacts", {}).get("layer", "<layer>.sqsh")
+        print("\nMount it in a job (the layer appears at /user-software):")
+        print("  singularity exec --no-home -B <repo>:/workspace:ro \\")
+        print(f"    -B {layer}:/user-software:image-src=/ \\")
+        print(f"    {report['base_image']} /user-software/bin/python <script>")
+
+
+def main(argv: List[str]) -> int:
+    try:
+        options = parse_args(argv)
+    except ToolError as exc:
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return exc.code
+    except SystemExit as exc:  # argparse: --help, --version, or a usage error
+        return int(exc.code or 0)
+    except ValueError as exc:  # a malformed environment file, read to derive the layer id
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if in_container():
+        print(
+            f"{TOOL}: error: this is running inside a container, which has no singularity. "
+            "Containers do not nest on LUMI -- run this in a plain login shell.",
+            file=sys.stderr,
+        )
+        return EXIT_ENVIRONMENT
+    for tool in ("singularity", "mksquashfs", "sha256sum"):
+        if not shutil.which(tool):
+            print(f"{TOOL}: error: no {tool} on PATH", file=sys.stderr)
+            return EXIT_ENVIRONMENT
+
+    try:
+        plan, report = build(options)
+    except Conflicts as exc:
+        print_report(exc.report, options.as_json, exc.plan)
+        print(f"{TOOL}: {exc}", file=sys.stderr)
+        return EXIT_CONFLICT
+    except ToolError as exc:
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return exc.code
+    except ValueError as exc:
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    print_report(report, options.as_json, plan)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

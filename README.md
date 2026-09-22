@@ -97,19 +97,19 @@ first-lumi-model/
 ├── env.sh                        your project id and paths -- the one file you edit
 ├── setup.sh                      writes env.sh and creates the directories, if you prefer
 ├── environment.yml               the conda environment from your laptop
-├── build-layer.sh                step 3: your packages -> one .sqsh file
+├── layer-build/                   step 3: the builder -- the tool, its manual and its tests
 ├── src/minimodel/                the model and its synthetic data (portable, no LUMI in it)
 ├── workflow/
-│   ├── envs/extra-requirements.txt   what LUMI must ADD to the AI image
+│   ├── envs/extra-environment.yml    what LUMI must ADD to the AI image
 │   ├── profiles/lumi-g/train.sbatch  the LUMI-shaped part: resources, binds, paths
 │   └── scripts/train.py              the training loop
 └── tools/check_platform.py       "is there really a GPU in here?" -- run before you submit
 ```
 
 The model and the training loop are portable Python: the same files run on your laptop and inside the
-container on a GPU. The LUMI adaptation is the other four: `env.sh`, `build-layer.sh`, the extras
-list (`workflow/envs/extra-requirements.txt`, which is written *against this image*) and
-`workflow/profiles/lumi-g/train.sbatch`.
+container on a GPU. The LUMI adaptation is the other four: `env.sh`, `layer-build/` (the tool that
+builds the layer), the extras list (`workflow/envs/extra-environment.yml`, which is written *against
+this image*) and `workflow/profiles/lumi-g/train.sbatch`.
 
 ## Step 0 — put these files on LUMI (~5 minutes)
 
@@ -243,7 +243,7 @@ LUMI's AI image (14 GB, read-only, shared)     your layer (one small file)
 
 At run time one container mounts both: the image as `/`, your layer at `/user-software`.
 
-You write down the difference in `workflow/envs/extra-requirements.txt` — for this example that is
+You write down the difference in `workflow/envs/extra-environment.yml` — for this example that is
 `seaborn` and `torchinfo`, and nothing else.
 
 What makes this cheap is `python -m venv --system-site-packages`: it creates a normal virtual
@@ -252,25 +252,44 @@ holds only your additions, and the image's torch — the one built for this hard
 code imports. That is also why the layer is tied to one image, and why the image's version is
 recorded beside it.
 
-Then one command builds it, and it refuses to leave a half-built file behind:
+Then one command builds it. The builder is [`layer-build/layer-build`](layer-build/MANUAL.md) — a small
+tool in this folder with its manual beside it. It reads the extras list, asks the image what it
+already has, installs only the difference, and **refuses** anything that would shadow the image's own
+stack (a second numpy, a different torch) instead of quietly building a layer that breaks the ROCm
+build:
 
 ```bash
+SIF="$(cat "$LUMI_SOFTWARE/laifs/base.path")"
 LAYER_ID="first-model-$(date -u +%Y%m%d)"
-./build-layer.sh "$LAYER_ID"
 
-export MODEL_LAYER="$LUMI_SOFTWARE/venvs/$LAYER_ID.sqsh"
-echo "$MODEL_LAYER"                # every job from now on needs this value
+# step 2 made the image checksum optional: pass it only if it is there
+SHA=""
+if [ -s "$LUMI_SOFTWARE/laifs/base.path.sha256" ]; then
+  SHA="--base-sha256=$LUMI_SOFTWARE/laifs/base.path.sha256"
+fi
+
+"$EXAMPLE_DIR/layer-build/layer-build" --base "$SIF" $SHA \
+  --env "$EXAMPLE_DIR/workflow/envs/extra-environment.yml" \
+  --id "$LAYER_ID" --out "$LUMI_SOFTWARE/venvs" \
+  --export-to "$EXAMPLE_DIR/env.sh"
+
+. "$EXAMPLE_DIR/env.sh"   # pick up the MODEL_LAYER line the tool wrote
+echo "$MODEL_LAYER"       # every job from now on needs this value
 ```
 
-The script runs that `venv` *inside* the image, installs your extras, checks them by importing,
-verifies the pinned image's checksum (when step 2 recorded one), packs the directory into one
-SquashFS file (`.sqsh`), then validates the packed file at the path jobs will mount it. When LAIF
-publishes a new base, rebuild the layer.
+The tool runs that `venv` *inside* the image, installs your extras, checks that every one of them
+imports, verifies the pinned image's checksum (when step 2 recorded one), packs the directory into
+one SquashFS file (`.sqsh`), then validates the packed file at the path jobs will mount it —
+including a `pip check` comparison against the image alone, so a conflict the image already had is
+not blamed on your packages. When LAIF publishes a new base, rebuild the layer.
 
-Then add the `export MODEL_LAYER=...` line to `env.sh`, so new shells have it too.
+Then the tool writes the `export MODEL_LAYER=...` line into `env.sh` itself, so new shells have it —
+and rewrites that one line on every rebuild, so it never stacks up. A shell that is already open sees
+it only after `. ./env.sh`, and that re-read is what step 4 needs: `srun` starts from the shell you run
+it in.
 
-**What success looks like.** The script ends with `published <path>`, then prints the
-`export MODEL_LAYER=...` line to copy. Four files must exist — the layer and three records beside it
+**What success looks like.** The tool ends with `published <path>`, then a loud block naming the
+`export MODEL_LAYER=...` line it wrote into `env.sh`. Four files must exist — the layer and three records beside it
 — and a leftover `.partial` means the publication was interrupted, so treat that version as
 unpublished:
 
@@ -312,16 +331,20 @@ srun --account="$PROJECT_ID" --partition=dev-g \
 `srun` waits for the resources, then your prompt is on a node (`nid0XXXXX`) with a GCD reserved for
 you. `dev-g` is the debug partition: same cheap billing, shorter queue, meant for exactly this and
 not for real training. Variables you exported on the login node travel into this shell with `srun`,
-so `$EXAMPLE_DIR` and `$MODEL_LAYER` are already set. Now, *inside that shell*:
+so `$EXAMPLE_DIR` is already set — and `$MODEL_LAYER` too, if step 3's `env.sh` line reached the shell
+you ran `srun` from. The two checks at the top of the block below are how you find out. Now, *inside
+that shell*:
 
 ```bash
 SIF="$(cat "$LUMI_SOFTWARE/laifs/base.path")"
 
-# Check this before the binds below: if EXAMPLE_DIR is empty, the bind arrives as
-# ":/workspace:ro", and Singularity reads `ro` as the destination -- the FATAL
-# listed under "When something goes wrong" below.
-echo "[$EXAMPLE_DIR]"
-test -n "$EXAMPLE_DIR" || echo "EMPTY: source env.sh on the login node, rerun srun"
+# Check both before the binds below: an empty variable makes the bind arrive as
+# ":/workspace:ro" or ":/user-software:image-src=/", and the two FATALs under
+# "When something goes wrong" below are what Singularity makes of that. So stop here,
+# rather than spend an allocation on a bind that cannot work.
+echo "[$EXAMPLE_DIR] [$MODEL_LAYER]"
+test -n "$EXAMPLE_DIR" || { echo "EXAMPLE_DIR EMPTY: . ./env.sh, then rerun srun"; exit 1; }
+test -n "$MODEL_LAYER" || { echo "MODEL_LAYER EMPTY: . ./env.sh, then rerun srun"; exit 1; }
 
 # (a) The gate: is there really a usable GPU in this allocation?
 singularity exec --no-home --pwd /workspace \
@@ -354,11 +377,14 @@ AMD's CUDA-equivalent runtime and kernel language, the thing ROCm builds from
 ([What is HIP?](https://rocm.docs.amd.com/projects/HIP/en/latest/what_is_hip.html)); the `hip` line
 above is the version of it this torch was built against, so a CUDA or CPU build prints `None`.
 
-Why the `-B` flags: LUMI does **not** mount `/scratch` or `/project` into a container, and
-`/scratch/<project>` is a symlink, so you bind the *full* path
-([container jobs](https://docs.lumi-supercomputer.eu/runjobs/scheduled-jobs/container-jobs/)). Why
-`/user-software/bin/python` and not `python`: that is the layer's own interpreter, the one that can
-see your packages.
+Why the `-B` flags: nothing is mounted into a container unless you ask, so a path inside the container
+comes only from a `-B` you wrote, and the *source* is a path on the login node or the node you are on
+([container jobs](https://docs.lumi-supercomputer.eu/runjobs/scheduled-jobs/container-jobs/)). Both
+forms of the source work — `$LUMI_RUNS`, and the `/pfs/lustref…` path that `/scratch` is a symlink to —
+because the runtime resolves the source on the host: job `22236308` wrote its results through a bind of
+`/scratch/…/runs/22236308`. What does *not* work is expecting the container to see `/scratch` by
+itself. Why `/user-software/bin/python` and not `python`: that is the layer's own interpreter, the one
+that can see your packages.
 
 ## Step 5 — submit the training job with `sbatch` (20 minutes, at most 0.17 GPU-hours)
 
@@ -443,9 +469,10 @@ Each of these has a cause you can check. None of them means LUMI is broken.
 
 | What you see | What it means | What to do |
 |---|---|---|
-| `FATAL: container creation failed: unable to add /workspace to mount list: destination must be an absolute path` | `$EXAMPLE_DIR` was **empty** in that shell — not a directory problem: `-B ":/workspace:ro"` is read as source `/workspace`, destination `ro` | on the compute node, `echo "[$EXAMPLE_DIR]"` — `[]` means the shell never sourced `env.sh`. Source it on the login node and rerun `srun --pty` |
+| `FATAL: container creation failed: unable to add /workspace to mount list: destination must be an absolute path` | `$EXAMPLE_DIR` was **empty** in that shell, so `-B ":/workspace:ro"` had no source — the bind string is the problem, not the directory | on the compute node, `echo "[$EXAMPLE_DIR]"` — `[]` means this shell has no usable value from `env.sh`. Source it on the login node and rerun `srun --pty` |
+| `FATAL: container creation failed: unable to add /user-software to mount list: destination must be an absolute path` | `$MODEL_LAYER` was **empty** in that shell, so `-B ":/user-software:image-src=/"` had no source — the same empty-variable failure as the row above, one command later | on the compute node, `echo "[$MODEL_LAYER]"` — `[]` means this shell has no usable `MODEL_LAYER` from `env.sh`. Run `. ./env.sh` on the login node, rerun `srun --pty` |
 | `ModuleNotFoundError: seaborn` | the layer is not mounted, or `python` is the image's own | add `-B "$MODEL_LAYER:/user-software:image-src=/"` and call `/user-software/bin/python` |
-| `No such file` for a path you can `ls` on the login node | `/scratch` is not mounted in containers by default | bind the full path: `$LUMI_RUNS`, never `/scratch` |
+| `No such file` inside the container for a path you can `ls` outside it | nothing is mounted into a container unless you name it in `-B` | add the bind: `-B "$LUMI_RUNS:/run:rw"`. Either form of the source works (see the note after step 4); what matters is naming it |
 | `hip None`, or training far slower than expected | CPU build, or no GPU in the allocation | check `--gpus-per-task=1`; run `check_platform.py cuda` |
 | `FAILED: ... cuda` from `check_platform.py` | the allocation has no usable GCD | resubmit; check `sinfo -s` for node state |
 | matplotlib complains about a config directory | `$HOME` is not mounted (`--no-home`) | already handled in `train.py`; do the same in your own code |
@@ -453,13 +480,13 @@ Each of these has a cause you can check. None of them means LUMI is broken.
 | `sbatch: error: invalid account` | `PROJECT_ID` in `env.sh` is wrong | `lumi-workspaces` prints the right one |
 | job killed on a login node (`Killed`, exit 137) | heavy work on a login node: a 24 CPU-core-hour cap is enforced by killing | move it into `srun --pty` |
 | quota warnings, `lumi-quota -v` file count exploding | packages were installed onto Lustre | that is exactly what the layer prevents; rebuild it instead |
-| the job starts, then dies with `No module named torchinfo` | a package was added to the *image*'s Python instead of the layer | add it to `extra-requirements.txt` and rebuild with a new `LAYER_ID` |
+| the job starts, then dies with `No module named torchinfo` | a package was added to the *image*'s Python instead of the layer | add it to `extra-environment.yml` and rebuild with a new `LAYER_ID` |
 | `error: this is running inside a container, which has no singularity` | you are in a container, and **containers do not nest on LUMI** — a `singularity` inside one cannot start another | find out for certain with `echo "$SINGULARITY_CONTAINER"`: a path means you are in one. Type `exit` to leave it and rerun the command in a plain login shell. On a login node you are normally *not* in one, so meeting this usually means something put you in a container deliberately |
 | `OMP: Error #15 ... libomp.dylib already initialized`, **on your laptop, in step 1** | your process holds two OpenMP runtimes: conda-forge's default `numpy` comes with the OpenMP build of OpenBLAS, and pip's `torch` wheel ships its own `libomp.dylib` | re-solve step 1's environment: `conda env update -f environment.yml`, which pins `libopenblas=*=*pthreads*` — the build of OpenBLAS that links no OpenMP, so your process loads the runtime once. (`llvm-openmp` can still be *installed*; what matters is which runtime a process loads.) |
 
 ## Where to go next
 
-Five short pointers. Each goes deeper only if you need it — nothing here is required for the
+Six short pointers. Each goes deeper only if you need it — nothing here is required for the
 tutorial's steps.
 
 | If you want to… | Read |
@@ -468,7 +495,8 @@ tutorial's steps.
 | **use more than one GCD** | [`docs/more-gpus.md`](docs/more-gpus.md) — one GCD is one process, and `--ntasks-per-node` plus `torchrun` is 64 processes for 8 GCDs |
 | **watch a run, or use a notebook** | [`docs/observing-a-run.md`](docs/observing-a-run.md) — TensorBoard and Jupyter through LUMI's web interface |
 | **let a coding agent do the boring parts** | [`docs/working-with-an-agent.md`](docs/working-with-an-agent.md) — what to tell it, and the five specific mistakes it will make here |
-| **run several environments in one workflow** | the environment manual's §9, "The general pattern: adding a training task" — the long form of step 3, with sources. It lives in the author's `lumi-env` repository alongside this folder; ask for access if you want it |
+| **run several environments in one workflow** | not covered here — this tutorial builds one environment, and [`docs/other-ways-to-build-an-environment.md`](docs/other-ways-to-build-an-environment.md) says when that shape is the wrong one |
+| **build a layer for your own packages** | [`layer-build/MANUAL.md`](layer-build/MANUAL.md) — the builder step 3 calls: what it accepts, what it refuses, its exit codes, and what has actually been run |
 
 **The short version of the boundary, in case you read nothing else:** this route is the cheap
 default for one class of task — packages you *add* to the AI image. When your extras would
@@ -478,19 +506,20 @@ starts.
 
 ## Status: what has been run on LUMI and what has not
 
-This example is written against LUMI's documentation and against the author's own run log, kept
-separately in the `lumi-env` environment manual. Being precise about what has actually been executed
-is a house rule there, and it is also how you should read anyone else's example.
+This example is written against LUMI's documentation and against runs the author did on LUMI. Those
+runs are recorded below by job id and date — that table is the record you can check. Being precise
+about what has actually been executed is the point, and it is also how you should read anyone else's
+example.
 
 | Claim | Status |
 |---|---|
 | The AI image path, its contents, `latest` being a symlink into a versioned directory | **verified** — read from the release directory and its own published package list, 2026-09-17 |
-| A pinned `lumi-multitorch-full` image training a model on one GCD (`hip 7.0.51831`) | **verified** — job `22098853`, 2026-09-16 (a sibling toy model in the author's repository) |
+| A pinned `lumi-multitorch-full` image training a model on one GCD (`hip 7.0.51831`) | **verified** — job `22098853`, 2026-09-16, on a sibling toy model rather than this folder's `train.py`: evidence about the **image**, not about this script |
 | `srun --pty bash` giving a shell on a compute node, and jobs submitted from it | **verified** — jobs `22099993`, `22116162`, `22100268`, 2026-09-16/17 |
 | `mksquashfs` available on a login node | **verified** — 2026-09-13 |
-| **The layer route itself** — venv inside the image at `/user-software` → one `.sqsh` → validate at the final path → mount it in a job → train on one GCD | **verified**, on a real workflow, 2026-09-17/18: the layer was built, accepted under real Singularity and on a GCD, and the model trained (`hip 7.0.51831`, job `22149955`) |
-| **`build-layer.sh` in this folder** — this tutorial's own copy of that build | **not yet run on LUMI.** It is step 3, and the first thing to check if something here fails. Its dependency gate was corrected on 2026-09-18 to match what the real image needs |
-| This example end to end, as written | **not yet run.** Treat the first pass as the test |
+| **The layer route itself** — venv inside the image at `/user-software` → one `.sqsh` → validate at the final path → mount it in a job → train on one GCD | **verified**, on a real workflow outside this folder, 2026-09-17/18: the layer was built, accepted under real Singularity and on a GCD, and the model trained (`hip 7.0.51831`, job `22149955`) |
+| **`layer-build/layer-build`** — the builder, its manual and its tests | **built a real layer on LUMI and trained with it, 2026-09-22.** Published on the login node `uan01` (5 MB, three records, `sha256sum -c` clean), mounted at `/user-software` in an `srun --pty` allocation on `dev-g` (job `22235946`), then used by `sbatch` with `train.sbatch` (job `22236308`, `small-g`), where the run manifest recorded both hashes. 47 local tests beside. **Not yet exercised:** the conflict path against a real image, `--allow-shadow`, `--keep-stage`, and the human (non-JSON) report branch |
+| This example end to end, as written | **verified**, 2026-09-22, steps 0-6 on LUMI: the layer was built on a login node (`uan01`), trained on an MI250X GCD interactively (job `22235946`, `dev-g`) and submitted as a batch job (job `22236308`, `small-g`, 30 epochs, `OK 30 epochs in 2.23s`, `hip 7.0.51831`), with the run manifest recording both hashes |
 
 If a step fails in a way this page does not explain, that is a defect in the page: write down the
 command and its real output, then fix the page. Both, or the guide and reality diverge. Feedback and
